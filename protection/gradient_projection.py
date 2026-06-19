@@ -27,6 +27,7 @@ from .task_memory import TaskMemory
 def collect_expert_gradients(model) -> torch.Tensor:
     """
     收集所有 expert/prompt 参数的梯度，拼接为一个向量。
+    使用排序后的参数名，与 project_gradients_to_minor_subspace 保持一致顺序。
 
     Args:
         model: SMoPE 模型的 prompt 模块
@@ -35,7 +36,7 @@ def collect_expert_gradients(model) -> torch.Tensor:
         grad_vec: [d_total] 拼接后的梯度向量
     """
     grads = []
-    for name, p in model.named_parameters():
+    for name, p in sorted(model.named_parameters()):
         if p.grad is not None and ("e_pk" in name or "e_pv" in name):
             grads.append(p.grad.detach().view(-1))
     if not grads:
@@ -150,33 +151,25 @@ def project_gradients_to_minor_subspace(
     if U.device != device:
         U = U.to(device)
 
-    # ── 收集所有 expert 参数的梯度 ──
-    grad_parts = []
-    param_refs = []
-    param_shapes = []
-
-    for name, p in model.named_parameters():
+    # ── 收集所有 expert 参数的梯度（单次遍历，保证顺序一致）──
+    # 使用排序后的参数名确保 collect_expert_gradients (SVD时) 与
+    # project_gradients_to_minor_subspace (投影时) 的顺序完全一致
+    param_entries = []  # list of (name, param, shape, grad_flat)
+    for name, p in sorted(model.named_parameters()):
         if p.grad is not None and ("e_pk" in name or "e_pv" in name):
-            grad_parts.append(p.grad.view(-1))
-            param_refs.append(p)
-            param_shapes.append(p.grad.shape)
+            param_entries.append((name, p, p.grad.shape, p.grad.view(-1)))
 
-    if not grad_parts:
+    if not param_entries:
         return
 
-    g = torch.cat(grad_parts)  # [d_total]
+    g = torch.cat([entry[3] for entry in param_entries])  # [d_total]
 
     # ── 计算每个 expert 的 protection strength α ──
-    # 解析 expert 使用频率
     max_freqs = _get_max_expert_freqs(old_memories, model)
 
     # ── 按 expert 分段投影 ──
     offset = 0
-    for name, p, shape in zip(
-        [n for n, _ in model.named_parameters() if ("e_pk" in n or "e_pv" in n) and _.grad is not None],
-        param_refs,
-        param_shapes,
-    ):
+    for name, p, shape, _grad_flat in param_entries:
         n = p.grad.numel()
         g_i = g[offset : offset + n]  # 该参数的梯度段
 

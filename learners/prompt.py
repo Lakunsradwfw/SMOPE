@@ -198,6 +198,7 @@ class OnePrompt(Prompt):
                 "use_alternating_update": False,
                 "temperature": 1.0,
             }
+        print(f"[DEBUG] v1_config = {self._v1_config}")
 
     def create_model(self):
         cfg = self.config
@@ -278,6 +279,26 @@ class OnePrompt(Prompt):
         v1 = self._v1_config
         prompt = self.model.module.prompt if hasattr(self.model, 'module') else self.model.prompt
 
+        # ── v1: 构建 task_id → input_prototypes 查找表（供组件一、三使用）──
+        task_input_protos = {}
+        if self.old_memories:
+            for mem in self.old_memories:
+                if mem.input_prototypes is not None:
+                    task_input_protos[mem.task_id] = mem.input_prototypes
+
+        def make_router_logits_for_task_fn(_prompt, _task_input_protos, _device):
+            """闭包：返回给定 task_id 的当前 router logits [C_t, K]"""
+            def fn(task_id):
+                ip = _task_input_protos.get(task_id)
+                if ip is None:
+                    return None
+                return _prompt.get_router_logits_from_input_repr(ip.to(_device))
+            return fn
+
+        router_logits_for_task = make_router_logits_for_task_fn(
+            prompt, task_input_protos, inputs.device
+        )
+
         # ═══════════════════════════════════════════════
         # Step 1: CE Loss + v1 保护正则（key 冻结）
         # ═══════════════════════════════════════════════
@@ -305,7 +326,9 @@ class OnePrompt(Prompt):
         lambda_router = v1.get("lambda_router", 0.0)
         if lambda_router > 0 and self.old_memories:
             def router_logits_fn(input_protos):
-                return prompt.get_router_and_input(input_protos)[0]
+                # input_protos [C_t, d] 是存储的 input representation
+                # 使用 get_router_logits_from_input_repr（不经过 ViT），梯度通过 e_pk 回传
+                return prompt.get_router_logits_from_input_repr(input_protos)
             L_kl = compute_router_kl_loss(
                 router_logits_fn,
                 self.old_memories,
@@ -313,15 +336,11 @@ class OnePrompt(Prompt):
             )
             total_loss = total_loss + lambda_router * L_kl
 
-        # ── v1 组件三前半：Prototype Alignment ──
+        # ── v1 组件三前半：Prototype Alignment（L2 约束 router logits）──
         lambda_proto = v1.get("lambda_proto", 0.0)
         if lambda_proto > 0 and self.old_memories:
-            def key_prototypes_fn(task_id):
-                return prompt.get_key_query(
-                    inputs[:1]
-                )  # simplified; real impl uses stored input
             L_proto = compute_prototype_alignment_loss(
-                key_prototypes_fn, self.old_memories
+                router_logits_for_task, self.old_memories
             )
             total_loss = total_loss + lambda_proto * L_proto
 
@@ -364,11 +383,10 @@ class OnePrompt(Prompt):
 
             key_optimizer.zero_grad()
 
-            def key_prototypes_fn(task_id):
-                return prompt.get_all_expert_keys()
-
+            # 使用 router logits 的 pairwise 相似度（而非 expert key 参数本身）
+            # router_logits_for_task 闭包返回 [C_t, K]，形状与 mem.router_pairwise_sim [C_t, C_t] 匹配
             L_key_rel = compute_key_relation_loss(
-                key_prototypes_fn, self.old_memories
+                router_logits_for_task, self.old_memories
             )
             L_key_rel = lambda_key * L_key_rel
             L_key_rel.backward()
@@ -599,13 +617,22 @@ class OnePrompt(Prompt):
         )
 
         # ── 组件一：保存 Router Prototype Distribution ──
-        if v1.get("lambda_router", 0.0) > 0:
+        # 注意：router_prototypes 和 input_prototypes 也被组件三（key_relation, proto_alignment）使用
+        need_router = (
+            v1.get("lambda_router", 0.0) > 0
+            or v1.get("lambda_key", 0.0) > 0
+            or v1.get("lambda_proto", 0.0) > 0
+        )
+        if need_router:
             try:
                 router_protos, input_protos = save_router_prototypes(
                     self.model, train_loader, num_classes, device
                 )
                 memory.router_prototypes = router_protos
                 memory.input_prototypes = input_protos
+                # 预计算 router prototypes 的 pairwise 相似度（供 compute_key_relation_loss 使用）
+                router_probs = F.softmax(router_protos, dim=-1)
+                memory.router_pairwise_sim = router_probs @ router_probs.T
             except Exception as e:
                 print(f"[v1] Warning: Failed to save router prototypes: {e}")
 

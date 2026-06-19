@@ -28,6 +28,8 @@ class TaskMemory:
         self.router_prototypes: Optional[torch.Tensor] = None
         # 每个类的 router softmax 概率（预计算以加速）
         self.router_probs: Optional[torch.Tensor] = None
+        # router prototypes 的 pairwise 相似度矩阵: [num_classes, num_classes]
+        self.router_pairwise_sim: Optional[torch.Tensor] = None
         # 每个类的平均输入表征 x̃（用于计算当前 router 输出）
         self.input_prototypes: Optional[torch.Tensor] = None
 
@@ -50,6 +52,7 @@ class TaskMemory:
         for attr in [
             "router_prototypes",
             "router_probs",
+            "router_pairwise_sim",
             "input_prototypes",
             "global_major_subspace",
             "expert_usage_freq",
@@ -66,6 +69,7 @@ class TaskMemory:
         for attr in [
             "router_prototypes",
             "router_probs",
+            "router_pairwise_sim",
             "input_prototypes",
             "global_major_subspace",
             "expert_usage_freq",
@@ -83,6 +87,7 @@ class TaskMemory:
         for attr in [
             "router_prototypes",
             "router_probs",
+            "router_pairwise_sim",
             "input_prototypes",
             "global_major_subspace",
             "expert_usage_freq",
@@ -105,6 +110,7 @@ class TaskMemory:
         for attr in [
             "router_prototypes",
             "router_probs",
+            "router_pairwise_sim",
             "input_prototypes",
             "global_major_subspace",
             "expert_usage_freq",

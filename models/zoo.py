@@ -249,6 +249,9 @@ class OnePrompt(nn.Module):
         """
         返回 router logits [B, K] 和 average input representation [B, d]，
         用于组件一（Router KL 散度正则）的 prototype 保存。
+
+        注意：此方法接收原始图像 x [B, 3, H, W]，内部调用 ViT patch_embed。
+        如果已有预计算的特征向量，请使用 get_router_logits_from_input_repr()。
         """
         # 通过 ViT 拿到中间表示
         B = x.shape[0]
@@ -274,6 +277,25 @@ class OnePrompt(nn.Module):
 
         # 计算 router logits：聚合所有 layer 所有 head 的 expert scores
         device = x.device
+        router_logits = self._compute_router_logits(x_querry)
+
+        return router_logits, x_querry
+
+    def get_router_logits_from_input_repr(self, x_querry):
+        """
+        从预计算的 input representation [B, d] 计算 router logits [B, K]。
+
+        与 get_router_and_input 不同，此方法不经过 ViT（不调用 patch_embed），
+        直接使用已有的特征向量计算 expert scores。用于训练时的 Router KL /
+        Prototype Alignment / Key Relation 损失计算，保证梯度可以通过 e_pk 回传。
+        """
+        return self._compute_router_logits(x_querry)
+
+    def _compute_router_logits(self, x_querry):
+        """
+        内部方法：从 input representation x_querry [B, d] 计算 router logits [B, K]。
+        聚合所有 layer × head 的 expert scores 并取平均。
+        """
         all_router_logits = []
         for e in self.e_layers:
             for h in range(self.num_heads):
@@ -288,8 +310,7 @@ class OnePrompt(nn.Module):
 
         # 对 layer 和 head 求平均
         router_logits = torch.stack(all_router_logits, dim=0).mean(dim=0)  # [B, K]
-
-        return router_logits, x_querry
+        return router_logits
 
     def get_all_expert_keys(self):
         """
@@ -389,14 +410,14 @@ class OnePrompt(nn.Module):
         return list(groups.values())
 
     def get_v1_config(self):
-        """返回 v1 保护机制所需的超参数默认值"""
+        """返回 v1 保护机制所需的超参数默认值（v1 已启用）"""
         return {
-            "lambda_router": 0.0,   # Router KL 散度权重（默认关闭）
-            "lambda_key": 0.0,      # Key Relation Distillation 权重（默认关闭）
-            "lambda_proto": 0.0,    # Prototype Alignment 权重（默认关闭）
+            "lambda_router": 0.1,   # Router KL 散度权重
+            "lambda_key": 0.5,      # Key Relation Distillation 权重
+            "lambda_proto": 0.05,   # Prototype Alignment 权重
             "freq_threshold": 0.1,  # Expert 使用频率阈值
-            "use_grad_projection": False,    # 是否启用梯度投影
-            "use_alternating_update": False, # 是否启用交替更新
+            "use_grad_projection": True,    # 是否启用梯度投影
+            "use_alternating_update": True, # 是否启用交替更新
             "temperature": 1.0,     # KL 散度温度
         }
 
