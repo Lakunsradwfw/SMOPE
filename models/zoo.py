@@ -241,6 +241,165 @@ class OnePrompt(nn.Module):
                     pk_h = pk_h.detach().clone()
                     setattr(self, f"old_e_pk_{e}_{l}_{h}", pk_h)
 
+    # ═══════════════════════════════════════════════════════════════
+    # v1 API: Heterogeneous Gradient Protection Interfaces
+    # ═══════════════════════════════════════════════════════════════
+
+    def get_router_and_input(self, x):
+        """
+        返回 router logits [B, K] 和 average input representation [B, d]，
+        用于组件一（Router KL 散度正则）的 prototype 保存。
+        """
+        # 通过 ViT 拿到中间表示
+        B = x.shape[0]
+        # 使用 ViT 的 patch_embed 和部分 blocks 来获取 input representation
+        # 简化：使用 patch embedding 后的平均池化作为 input representation
+        with torch.no_grad():
+            # 找到 ViT backbone
+            vit = None
+            for module in self.modules():
+                if hasattr(module, 'patch_embed') and hasattr(module, 'blocks'):
+                    vit = module
+                    break
+            if vit is not None:
+                x_patch = vit.patch_embed(x)
+                cls_tokens = vit.cls_token.expand(B, -1, -1)
+                x_patch = torch.cat((cls_tokens, x_patch), dim=1)
+                x_patch = x_patch + vit.pos_embed[:, :x_patch.size(1), :]
+                x_patch = vit.pos_drop(x_patch)
+                # x_querry: 对 patch tokens 做平均
+                x_querry = x_patch[:, 1:, :].mean(dim=1)  # [B, d]
+            else:
+                x_querry = x.mean(dim=[2, 3]) if x.dim() == 4 else x.mean(dim=1)
+
+        # 计算 router logits：聚合所有 layer 所有 head 的 expert scores
+        device = x.device
+        all_router_logits = []
+        for e in self.e_layers:
+            for h in range(self.num_heads):
+                pk_h_list = []
+                for i in range(self.num_experts):
+                    pk_h_list.append(getattr(self, f"e_pk_{e}_{i}_{h}"))
+                pk_h = torch.cat(pk_h_list, dim=0)  # [num_experts, head_dim]
+
+                # 每个 expert 的 score: x_querry @ pk_h_i
+                scores = x_querry @ pk_h.T  # [B, num_experts]
+                all_router_logits.append(scores)
+
+        # 对 layer 和 head 求平均
+        router_logits = torch.stack(all_router_logits, dim=0).mean(dim=0)  # [B, K]
+
+        return router_logits, x_querry
+
+    def get_all_expert_keys(self):
+        """
+        返回所有 expert key (e_pk) 拼接后的矩阵。
+        用于组件三（Key Relation Distillation）。
+
+        Returns:
+            all_keys: [num_experts * num_layers * num_heads, head_dim]
+        """
+        keys = []
+        for e in self.e_layers:
+            for l in range(self.num_experts):
+                for h in range(self.num_heads):
+                    pk = getattr(self, f"e_pk_{e}_{l}_{h}")  # [1, head_dim]
+                    keys.append(pk.view(-1))
+        if keys:
+            return torch.stack(keys, dim=0)  # [total, head_dim]
+        return None
+
+    def get_key_query(self, x):
+        """
+        返回输入 x 对 key 空间的查询向量（即 average input representation）。
+        用于组件三（Key Relation Distillation）的 prototype 保存。
+
+        Returns:
+            query: [B, d_key] 其中 d_key = num_heads * head_dim
+        """
+        B = x.shape[0]
+        vit = None
+        for module in self.modules():
+            if hasattr(module, 'patch_embed') and hasattr(module, 'blocks'):
+                vit = module
+                break
+        if vit is not None:
+            x_patch = vit.patch_embed(x)
+            cls_tokens = vit.cls_token.expand(B, -1, -1)
+            x_patch = torch.cat((cls_tokens, x_patch), dim=1)
+            x_patch = x_patch + vit.pos_embed[:, :x_patch.size(1), :]
+            x_patch = vit.pos_drop(x_patch)
+            # 使用 cls_token 作为 key query
+            query = x_patch[:, 0, :]  # [B, embed_dim]
+        else:
+            query = x.mean(dim=[2, 3]) if x.dim() == 4 else x.mean(dim=1)
+        return query
+
+    def freeze_keys(self):
+        """冻结所有 e_pk 参数（用于 alternating update 的 Step 1）"""
+        for e in self.e_layers:
+            for l in range(self.num_experts):
+                for h in range(self.num_heads):
+                    p = getattr(self, f"e_pk_{e}_{l}_{h}")
+                    p.requires_grad = False
+
+    def unfreeze_keys(self):
+        """解冻所有 e_pk 参数（用于 alternating update 的 Step 2）"""
+        for e in self.e_layers:
+            for l in range(self.num_experts):
+                for h in range(self.num_heads):
+                    p = getattr(self, f"e_pk_{e}_{l}_{h}")
+                    p.requires_grad = True
+
+    def freeze_experts(self):
+        """冻结所有 expert 参数（e_pk + e_pv），仅保留 key 可训练"""
+        for e in self.e_layers:
+            for l in range(self.num_experts):
+                for h in range(self.num_heads):
+                    getattr(self, f"e_pk_{e}_{l}_{h}").requires_grad = False
+                    getattr(self, f"e_pv_{e}_{l}_{h}").requires_grad = False
+
+    def unfreeze_experts(self):
+        """解冻所有 expert 参数"""
+        for e in self.e_layers:
+            for l in range(self.num_experts):
+                for h in range(self.num_heads):
+                    getattr(self, f"e_pk_{e}_{l}_{h}").requires_grad = True
+                    getattr(self, f"e_pv_{e}_{l}_{h}").requires_grad = True
+
+    def get_expert_param_groups(self):
+        """
+        返回按 expert 分组的参数列表，用于梯度投影。
+
+        Returns:
+            list of list of parameters: 每个子列表对应一个 expert 的所有参数
+        """
+        groups = {}
+        for name, p in self.named_parameters():
+            if "e_pk" in name or "e_pv" in name:
+                parts = name.split("_")
+                if len(parts) >= 4 and parts[0] == "e" and parts[1] in ("pk", "pv"):
+                    try:
+                        expert_idx = int(parts[3])
+                        if expert_idx not in groups:
+                            groups[expert_idx] = []
+                        groups[expert_idx].append(p)
+                    except (ValueError, IndexError):
+                        pass
+        return list(groups.values())
+
+    def get_v1_config(self):
+        """返回 v1 保护机制所需的超参数默认值"""
+        return {
+            "lambda_router": 0.0,   # Router KL 散度权重（默认关闭）
+            "lambda_key": 0.0,      # Key Relation Distillation 权重（默认关闭）
+            "lambda_proto": 0.0,    # Prototype Alignment 权重（默认关闭）
+            "freq_threshold": 0.1,  # Expert 使用频率阈值
+            "use_grad_projection": False,    # 是否启用梯度投影
+            "use_alternating_update": False, # 是否启用交替更新
+            "temperature": 1.0,     # KL 散度温度
+        }
+
 
 class VQPrompt(nn.Module):
     def __init__(self, emb_d, n_tasks, prompt_param, key_dim=768):

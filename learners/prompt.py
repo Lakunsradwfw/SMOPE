@@ -16,6 +16,25 @@ import torchvision
 from utils.schedulers import CosineSchedule, CosineSchedulerIter
 from torch.autograd import Variable, Function
 
+# ── v1: Heterogeneous Gradient Protection ──
+import protection
+from protection.task_memory import TaskMemory
+from protection.router_kl import (
+    compute_router_kl_loss,
+    save_router_prototypes,
+)
+from protection.gradient_projection import (
+    estimate_global_major_subspace,
+    project_gradients_to_minor_subspace,
+    collect_expert_gradients,
+    save_expert_usage_freqs,
+)
+from protection.key_relation import (
+    compute_key_relation_loss,
+    compute_prototype_alignment_loss,
+    save_key_prototypes,
+)
+
 
 class Prompt(NormalNN):
     def __init__(self, learner_config):
@@ -158,6 +177,27 @@ class VQPrompt(Prompt):
 class OnePrompt(Prompt):
     def __init__(self, learner_config):
         super(OnePrompt, self).__init__(learner_config)
+        # ── v1: Heterogeneous Gradient Protection state ──
+        self.old_memories: list = []  # List[TaskMemory]
+        self._v1_config = None  # lazy init after model creation
+
+    def _init_v1_config(self):
+        """初始化 v1 保护机制配置（从模型获取默认值）"""
+        if self._v1_config is not None:
+            return
+        try:
+            prompt = self.model.module.prompt if hasattr(self.model, 'module') else self.model.prompt
+            self._v1_config = prompt.get_v1_config()
+        except Exception:
+            self._v1_config = {
+                "lambda_router": 0.0,
+                "lambda_key": 0.0,
+                "lambda_proto": 0.0,
+                "freq_threshold": 0.1,
+                "use_grad_projection": False,
+                "use_alternating_update": False,
+                "temperature": 1.0,
+            }
 
     def create_model(self):
         cfg = self.config
@@ -233,6 +273,17 @@ class OnePrompt(Prompt):
             self.scheduler = CosineSchedulerIter(**scheduler_cfg)
 
     def update_model(self, inputs, targets, dense=False):
+        # ── v1: lazy init ──
+        self._init_v1_config()
+        v1 = self._v1_config
+        prompt = self.model.module.prompt if hasattr(self.model, 'module') else self.model.prompt
+
+        # ═══════════════════════════════════════════════
+        # Step 1: CE Loss + v1 保护正则（key 冻结）
+        # ═══════════════════════════════════════════════
+        if v1.get("use_alternating_update", False) and self.old_memories:
+            prompt.freeze_keys()
+
         # logits
         logits, prompt_loss = self.model(
             inputs, train=True, cls_mean=self.cls_mean, dense=dense
@@ -250,10 +301,80 @@ class OnePrompt(Prompt):
         # ce loss
         total_loss = total_loss + prompt_loss.sum()
 
+        # ── v1 组件一：Router KL 散度正则 ──
+        lambda_router = v1.get("lambda_router", 0.0)
+        if lambda_router > 0 and self.old_memories:
+            def router_logits_fn(input_protos):
+                return prompt.get_router_and_input(input_protos)[0]
+            L_kl = compute_router_kl_loss(
+                router_logits_fn,
+                self.old_memories,
+                temperature=v1.get("temperature", 1.0),
+            )
+            total_loss = total_loss + lambda_router * L_kl
+
+        # ── v1 组件三前半：Prototype Alignment ──
+        lambda_proto = v1.get("lambda_proto", 0.0)
+        if lambda_proto > 0 and self.old_memories:
+            def key_prototypes_fn(task_id):
+                return prompt.get_key_query(
+                    inputs[:1]
+                )  # simplified; real impl uses stored input
+            L_proto = compute_prototype_alignment_loss(
+                key_prototypes_fn, self.old_memories
+            )
+            total_loss = total_loss + lambda_proto * L_proto
+
         # step
         self.optimizer.zero_grad()
         total_loss.backward()
+
+        # ── v1 组件二：梯度投影到 Minor Subspace ──
+        if v1.get("use_grad_projection", False) and self.old_memories:
+            project_gradients_to_minor_subspace(
+                prompt,
+                self.old_memories,
+                freq_threshold=v1.get("freq_threshold", 0.1),
+            )
+
         self.optimizer.step()
+
+        # ═══════════════════════════════════════════════
+        # Step 2: Key Relation Distillation（key 解冻，expert 冻结）
+        # ═══════════════════════════════════════════════
+        lambda_key = v1.get("lambda_key", 0.0)
+        if (lambda_key > 0
+                and v1.get("use_alternating_update", False)
+                and self.old_memories):
+            prompt.unfreeze_keys()
+            prompt.freeze_experts()
+
+            # 使用一个独立的 key optimizer
+            key_params = []
+            for e in prompt.e_layers:
+                for l in range(prompt.num_experts):
+                    for h in range(prompt.num_heads):
+                        key_params.append(getattr(prompt, f"e_pk_{e}_{l}_{h}"))
+
+            key_optimizer = torch.optim.AdamW(
+                key_params,
+                lr=self.config["lr"] * 0.1,  # key 学习率更低
+                weight_decay=self.config["weight_decay"],
+            )
+
+            key_optimizer.zero_grad()
+
+            def key_prototypes_fn(task_id):
+                return prompt.get_all_expert_keys()
+
+            L_key_rel = compute_key_relation_loss(
+                key_prototypes_fn, self.old_memories
+            )
+            L_key_rel = lambda_key * L_key_rel
+            L_key_rel.backward()
+            key_optimizer.step()
+
+            prompt.unfreeze_experts()
 
         return total_loss.detach(), logits
 
@@ -428,6 +549,9 @@ class OnePrompt(Prompt):
         self.last_valid_out_dim = self.valid_out_dim
         self.first_task = False
 
+        # ── v1: on_task_finish — 保存旧任务约束信息 ──
+        self._on_task_finish(train_loader)
+
         # Extend memory
         self.task_count += 1
         if self.memory_size > 0:
@@ -439,6 +563,104 @@ class OnePrompt(Prompt):
             return batch_time.avg, need_train
         except:
             return None, need_train
+
+    # ═══════════════════════════════════════════════════════════
+    # v1: on_task_finish — 保存旧任务约束信息
+    # ═══════════════════════════════════════════════════════════
+    def _on_task_finish(self, train_loader):
+        """
+        在每个任务训练完成后调用。
+        保存 router prototypes、gradient subspace、key prototypes 等信息。
+        """
+        self._init_v1_config()
+        v1 = self._v1_config
+
+        # 检查是否有任何 v1 保护机制启用
+        any_v1_enabled = (
+            v1.get("lambda_router", 0.0) > 0
+            or v1.get("lambda_key", 0.0) > 0
+            or v1.get("lambda_proto", 0.0) > 0
+            or v1.get("use_grad_projection", False)
+        )
+        if not any_v1_enabled:
+            return
+
+        prompt = self.model.module.prompt if hasattr(self.model, 'module') else self.model.prompt
+
+        # 当前任务的类别数
+        num_classes = self.valid_out_dim - self.last_valid_out_dim
+        device = "cuda" if self.gpu else "cpu"
+
+        memory = TaskMemory(
+            task_id=self.task_count,
+            num_classes=num_classes,
+            num_experts=prompt.num_experts,
+            device=device,
+        )
+
+        # ── 组件一：保存 Router Prototype Distribution ──
+        if v1.get("lambda_router", 0.0) > 0:
+            try:
+                router_protos, input_protos = save_router_prototypes(
+                    self.model, train_loader, num_classes, device
+                )
+                memory.router_prototypes = router_protos
+                memory.input_prototypes = input_protos
+            except Exception as e:
+                print(f"[v1] Warning: Failed to save router prototypes: {e}")
+
+        # ── 组件二：估计 Global Major Subspace ──
+        if v1.get("use_grad_projection", False):
+            try:
+                all_grads = []
+                for x, y, _ in train_loader:
+                    if self.gpu:
+                        x, y = x.cuda(), y.cuda()
+                    self.model.zero_grad()
+                    logits, prompt_loss = self.model(
+                        x, train=True, cls_mean=self.cls_mean
+                    )
+                    logits = logits[:, : self.valid_out_dim]
+                    logits[:, : self.last_valid_out_dim] = -float("inf")
+                    dw_cls = self.dw_k[-1 * torch.ones(y.size()).long()]
+                    loss = self.criterion(logits, y.long(), dw_cls)
+                    loss = loss + prompt_loss.sum()
+                    loss.backward()
+                    grad_vec = collect_expert_gradients(prompt)
+                    all_grads.append(grad_vec)
+
+                if all_grads:
+                    grad_matrix = torch.stack(all_grads, dim=0)
+                    major_subspace, r = estimate_global_major_subspace(grad_matrix)
+                    memory.global_major_subspace = major_subspace
+                    memory.grad_matrix = grad_matrix
+                    print(f"[v1] Estimated global major subspace: d={grad_matrix.size(1)}, r={r}")
+            except Exception as e:
+                print(f"[v1] Warning: Failed to estimate gradient subspace: {e}")
+
+        # ── Expert 使用频率 ──
+        if v1.get("use_grad_projection", False):
+            try:
+                usage_freq = save_expert_usage_freqs(self.model, train_loader, device)
+                memory.expert_usage_freq = usage_freq
+            except Exception as e:
+                print(f"[v1] Warning: Failed to save expert usage freqs: {e}")
+
+        # ── 组件三：Key Prototypes & Pairwise Similarity ──
+        if v1.get("lambda_key", 0.0) > 0 or v1.get("lambda_proto", 0.0) > 0:
+            try:
+                key_protos, key_sim = save_key_prototypes(
+                    self.model, train_loader, num_classes, device
+                )
+                memory.key_prototypes = key_protos
+                memory.key_pairwise_sim = key_sim
+            except Exception as e:
+                print(f"[v1] Warning: Failed to save key prototypes: {e}")
+
+        # 保存到 old_memories 列表
+        self.old_memories.append(memory)
+        print(f"[v1] Task {self.task_count} memory saved. "
+              f"Total old memories: {len(self.old_memories)}")
 
 
 # @inproceedings{smith2023coda,
