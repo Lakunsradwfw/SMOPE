@@ -290,6 +290,10 @@ class OnePrompt(nn.Module):
         将 embed_dim 拆成 num_heads × head_dim，per-head 与 e_pk 点积后跨 head 平均，
         与原始 SMoPE router 的 per-head attention score 语义一致。
         """
+        # 确保输入与模型参数在同一设备（old_memories 中的 input_prototypes 保存在 CPU 上）
+        model_device = getattr(self, f"e_pk_{self.e_layers[0]}_0_0").device
+        x_querry = x_querry.to(model_device)
+
         B = x_querry.shape[0]
         # x_querry: [B, embed_dim=768] → [B, num_heads, head_dim]
         x_heads = x_querry.view(B, self.num_heads, self.head_dim)
