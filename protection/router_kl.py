@@ -131,7 +131,7 @@ def save_router_prototypes(
             y = y.to(device)
 
             # 获取 router logits 和 input representation
-            router_logits, input_repr = model.prompt.get_router_and_input(x)
+            router_logits, input_repr = model.prompt.get_router_and_input(x, vit=model.feat)
 
             all_router_logits.append(router_logits.cpu())
             all_input_repr.append(input_repr.cpu())

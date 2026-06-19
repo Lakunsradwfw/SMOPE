@@ -389,8 +389,9 @@ class OnePrompt(Prompt):
                 router_logits_for_task, self.old_memories
             )
             L_key_rel = lambda_key * L_key_rel
-            L_key_rel.backward()
-            key_optimizer.step()
+            if L_key_rel.requires_grad:
+                L_key_rel.backward()
+                key_optimizer.step()
 
             prompt.unfreeze_experts()
 

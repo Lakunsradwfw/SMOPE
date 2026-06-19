@@ -245,25 +245,20 @@ class OnePrompt(nn.Module):
     # v1 API: Heterogeneous Gradient Protection Interfaces
     # ═══════════════════════════════════════════════════════════════
 
-    def get_router_and_input(self, x):
+    def get_router_and_input(self, x, vit=None):
         """
         返回 router logits [B, K] 和 average input representation [B, d]，
         用于组件一（Router KL 散度正则）的 prototype 保存。
 
         注意：此方法接收原始图像 x [B, 3, H, W]，内部调用 ViT patch_embed。
         如果已有预计算的特征向量，请使用 get_router_logits_from_input_repr()。
+
+        Args:
+            x: 原始图像 [B, 3, H, W]
+            vit: VisionTransformer 实例（由调用方传入 model.feat）
         """
-        # 通过 ViT 拿到中间表示
         B = x.shape[0]
-        # 使用 ViT 的 patch_embed 和部分 blocks 来获取 input representation
-        # 简化：使用 patch embedding 后的平均池化作为 input representation
         with torch.no_grad():
-            # 找到 ViT backbone
-            vit = None
-            for module in self.modules():
-                if hasattr(module, 'patch_embed') and hasattr(module, 'blocks'):
-                    vit = module
-                    break
             if vit is not None:
                 x_patch = vit.patch_embed(x)
                 cls_tokens = vit.cls_token.expand(B, -1, -1)
@@ -271,12 +266,10 @@ class OnePrompt(nn.Module):
                 x_patch = x_patch + vit.pos_embed[:, :x_patch.size(1), :]
                 x_patch = vit.pos_drop(x_patch)
                 # x_querry: 对 patch tokens 做平均
-                x_querry = x_patch[:, 1:, :].mean(dim=1)  # [B, d]
+                x_querry = x_patch[:, 1:, :].mean(dim=1)  # [B, embed_dim]
             else:
                 x_querry = x.mean(dim=[2, 3]) if x.dim() == 4 else x.mean(dim=1)
 
-        # 计算 router logits：聚合所有 layer 所有 head 的 expert scores
-        device = x.device
         router_logits = self._compute_router_logits(x_querry)
 
         return router_logits, x_querry
@@ -293,9 +286,14 @@ class OnePrompt(nn.Module):
 
     def _compute_router_logits(self, x_querry):
         """
-        内部方法：从 input representation x_querry [B, d] 计算 router logits [B, K]。
-        聚合所有 layer × head 的 expert scores 并取平均。
+        内部方法：从 input representation x_querry [B, embed_dim] 计算 router logits [B, K]。
+        将 embed_dim 拆成 num_heads × head_dim，per-head 与 e_pk 点积后跨 head 平均，
+        与原始 SMoPE router 的 per-head attention score 语义一致。
         """
+        B = x_querry.shape[0]
+        # x_querry: [B, embed_dim=768] → [B, num_heads, head_dim]
+        x_heads = x_querry.view(B, self.num_heads, self.head_dim)
+
         all_router_logits = []
         for e in self.e_layers:
             for h in range(self.num_heads):
@@ -304,8 +302,8 @@ class OnePrompt(nn.Module):
                     pk_h_list.append(getattr(self, f"e_pk_{e}_{i}_{h}"))
                 pk_h = torch.cat(pk_h_list, dim=0)  # [num_experts, head_dim]
 
-                # 每个 expert 的 score: x_querry @ pk_h_i
-                scores = x_querry @ pk_h.T  # [B, num_experts]
+                # per-head score: [B, head_dim] @ [head_dim, num_experts] = [B, num_experts]
+                scores = x_heads[:, h, :] @ pk_h.T
                 all_router_logits.append(scores)
 
         # 对 layer 和 head 求平均
@@ -330,20 +328,19 @@ class OnePrompt(nn.Module):
             return torch.stack(keys, dim=0)  # [total, head_dim]
         return None
 
-    def get_key_query(self, x):
+    def get_key_query(self, x, vit=None):
         """
-        返回输入 x 对 key 空间的查询向量（即 average input representation）。
+        返回输入 x 对 key 空间的查询向量（cls_token）。
         用于组件三（Key Relation Distillation）的 prototype 保存。
 
+        Args:
+            x: 原始图像 [B, 3, H, W]
+            vit: VisionTransformer 实例（由调用方传入 model.feat）
+
         Returns:
-            query: [B, d_key] 其中 d_key = num_heads * head_dim
+            query: [B, embed_dim]
         """
         B = x.shape[0]
-        vit = None
-        for module in self.modules():
-            if hasattr(module, 'patch_embed') and hasattr(module, 'blocks'):
-                vit = module
-                break
         if vit is not None:
             x_patch = vit.patch_embed(x)
             cls_tokens = vit.cls_token.expand(B, -1, -1)

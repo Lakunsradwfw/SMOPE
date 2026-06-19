@@ -153,8 +153,8 @@ def save_key_prototypes(
             x = x.to(device)
             y = y.to(device)
 
-            # 获取 query（即 x_querry 平均输入表征），这代表了该样本对 key 空间的查询
-            key_q = model.prompt.get_key_query(x)  # [B, d_key]
+            # 获取 query（cls_token），这代表了该样本对 key 空间的查询
+            key_q = model.prompt.get_key_query(x, vit=model.feat)  # [B, embed_dim]
             all_key_queries.append(key_q.cpu())
             all_labels.append(y.cpu())
 
