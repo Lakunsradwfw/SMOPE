@@ -21,6 +21,8 @@ import protection
 from protection.task_memory import TaskMemory
 from protection.router_kl import (
     compute_router_kl_loss,
+    compute_router_kl_with_fallback,
+    compute_router_l2_loss,
     save_router_prototypes,
 )
 from protection.gradient_projection import (
@@ -28,12 +30,14 @@ from protection.gradient_projection import (
     project_gradients_to_minor_subspace,
     collect_expert_gradients,
     save_expert_usage_freqs,
+    IncrementalSubspaceEstimator,
 )
 from protection.key_relation import (
     compute_key_relation_loss,
     compute_prototype_alignment_loss,
     save_key_prototypes,
 )
+from protection.loss_logger import DiagnosticLogger, compute_key_sim_distance
 
 
 class Prompt(NormalNN):
@@ -180,6 +184,12 @@ class OnePrompt(Prompt):
         # ── v1: Heterogeneous Gradient Protection state ──
         self.old_memories: list = []  # List[TaskMemory]
         self._v1_config = None  # lazy init after model creation
+        # ── v2: Diagnostic Logger ──
+        self._diag_logger: DiagnosticLogger = None  # lazy init in _init_v1_config
+        self._batch_count = 0  # global batch counter for logging
+        self._task_epoch_count = 0  # epoch counter within current task
+        # ── v2: Incremental Subspace Estimator (P1) ──
+        self._subspace_estimator: IncrementalSubspaceEstimator = None
 
     def _init_v1_config(self):
         """初始化 v1 保护机制配置（从模型获取默认值）"""
@@ -197,8 +207,17 @@ class OnePrompt(Prompt):
                 "use_grad_projection": False,
                 "use_alternating_update": False,
                 "temperature": 1.0,
+                "key_temperature": 2.0,
+                "enable_diagnostic_log": False,
             }
         print(f"[DEBUG] v1_config = {self._v1_config}")
+
+        # ── v2: Lazy init DiagnosticLogger ──
+        if self._diag_logger is None and self._v1_config.get("enable_diagnostic_log", False):
+            self._diag_logger = DiagnosticLogger(
+                log_dir="outputs/cifar-100/10-task/one-prompt",
+                log_interval_batches=10,
+            )
 
     def create_model(self):
         cfg = self.config
@@ -274,12 +293,12 @@ class OnePrompt(Prompt):
             self.scheduler = CosineSchedulerIter(**scheduler_cfg)
 
     def update_model(self, inputs, targets, dense=False):
-        # ── v1: lazy init ──
+        # ── v2: lazy init ──
         self._init_v1_config()
         v1 = self._v1_config
         prompt = self.model.module.prompt if hasattr(self.model, 'module') else self.model.prompt
 
-        # ── v1: 构建 task_id → input_prototypes 查找表（供组件一、三使用）──
+        # ── v2: 构建 task_id → input_prototypes 查找表（供组件一、三使用）──
         task_input_protos = {}
         if self.old_memories:
             for mem in self.old_memories:
@@ -305,6 +324,13 @@ class OnePrompt(Prompt):
         if v1.get("use_alternating_update", False) and self.old_memories:
             prompt.freeze_keys()
 
+        # ── v2: 分离各 loss 分量用于诊断日志 ──
+        L_ce_val = torch.tensor(0.0, device=inputs.device)
+        L_kl_val = torch.tensor(0.0, device=inputs.device)
+        L_proto_val = torch.tensor(0.0, device=inputs.device)
+        L_key_val = torch.tensor(0.0, device=inputs.device)
+        kl_fallback = "none"
+
         # logits
         logits, prompt_loss = self.model(
             inputs, train=True, cls_mean=self.cls_mean, dense=dense
@@ -321,34 +347,38 @@ class OnePrompt(Prompt):
 
         # ce loss
         total_loss = total_loss + prompt_loss.sum()
+        L_ce_val = total_loss.detach().clone()
 
-        # ── v1 组件一：Router KL 散度正则 ──
+        # ── v2 组件一：Router KL 散度正则（带自动 NaN→L2 退化）──
         lambda_router = v1.get("lambda_router", 0.0)
         if lambda_router > 0 and self.old_memories:
             def router_logits_fn(input_protos):
-                # input_protos [C_t, d] 是存储的 input representation
-                # 使用 get_router_logits_from_input_repr（不经过 ViT），梯度通过 e_pk 回传
                 return prompt.get_router_logits_from_input_repr(input_protos)
-            L_kl = compute_router_kl_loss(
+
+            L_kl_raw, kl_fallback = compute_router_kl_with_fallback(
                 router_logits_fn,
                 self.old_memories,
                 temperature=v1.get("temperature", 1.0),
             )
-            total_loss = total_loss + lambda_router * L_kl
+            L_kl_val = L_kl_raw.detach().clone()
+            if not torch.isnan(L_kl_raw) and not torch.isinf(L_kl_raw):
+                total_loss = total_loss + lambda_router * L_kl_raw
 
-        # ── v1 组件三前半：Prototype Alignment（L2 约束 router logits）──
+        # ── v2 组件三前半：Prototype Alignment（L2 约束 router logits）──
         lambda_proto = v1.get("lambda_proto", 0.0)
         if lambda_proto > 0 and self.old_memories:
             L_proto = compute_prototype_alignment_loss(
                 router_logits_for_task, self.old_memories
             )
-            total_loss = total_loss + lambda_proto * L_proto
+            L_proto_val = L_proto.detach().clone()
+            if not torch.isnan(L_proto) and not torch.isinf(L_proto):
+                total_loss = total_loss + lambda_proto * L_proto
 
         # step
         self.optimizer.zero_grad()
         total_loss.backward()
 
-        # ── v1 组件二：梯度投影到 Minor Subspace ──
+        # ── v2 组件二：梯度投影到 Minor Subspace ──
         if v1.get("use_grad_projection", False) and self.old_memories:
             project_gradients_to_minor_subspace(
                 prompt,
@@ -383,17 +413,35 @@ class OnePrompt(Prompt):
 
             key_optimizer.zero_grad()
 
-            # 使用 router logits 的 pairwise 相似度（而非 expert key 参数本身）
-            # router_logits_for_task 闭包返回 [C_t, K]，形状与 mem.router_pairwise_sim [C_t, C_t] 匹配
+            # v2: 使用温度参数软化相似度矩阵
             L_key_rel = compute_key_relation_loss(
-                router_logits_for_task, self.old_memories
+                router_logits_for_task, self.old_memories,
+                temperature=v1.get("key_temperature", 2.0),
             )
-            L_key_rel = lambda_key * L_key_rel
-            if L_key_rel.requires_grad:
-                L_key_rel.backward()
+            L_key_val = L_key_rel.detach().clone()
+            L_key_weighted = lambda_key * L_key_rel
+            if L_key_weighted.requires_grad and not torch.isnan(L_key_weighted):
+                L_key_weighted.backward()
                 key_optimizer.step()
 
             prompt.unfreeze_experts()
+
+        # ── v2: 诊断日志记录 ──
+        has_nan = (torch.isnan(total_loss) or torch.isinf(total_loss))
+        if self._diag_logger is not None:
+            self._diag_logger.log_losses(
+                task_id=self.task_count,
+                epoch=self._task_epoch_count,
+                batch=self._batch_count,
+                l_ce=float(L_ce_val.item()) if not torch.isnan(L_ce_val).any() else float('nan'),
+                l_kl=float(L_kl_val.item()) if not torch.isnan(L_kl_val).any() else float('nan'),
+                l_key_rel=float(L_key_val.item()) if not torch.isnan(L_key_val).any() else float('nan'),
+                l_proto=float(L_proto_val.item()) if not torch.isnan(L_proto_val).any() else float('nan'),
+                l_total=float(total_loss.detach().item()) if not has_nan else float('nan'),
+                has_nan=bool(has_nan),
+                fallback_used=kl_fallback if kl_fallback != "kl" else "",
+            )
+        self._batch_count += 1
 
         return total_loss.detach(), logits
 
@@ -408,6 +456,7 @@ class OnePrompt(Prompt):
         if self.schedule_type == "coswm":  # step scheduler at each iter
             for epoch in range(num_epochs):
                 self.epoch = epoch
+                self._task_epoch_count = epoch  # v2: epoch tracking for diagnostic log
 
                 # for param_group in self.optimizer.param_groups:
                 #     self.log('LR:', param_group['lr'])
@@ -455,6 +504,7 @@ class OnePrompt(Prompt):
         else:
             for epoch in range(num_epochs):
                 self.epoch = epoch
+                self._task_epoch_count = epoch  # v2: epoch tracking for diagnostic log
 
                 if epoch > 0:
                     self.scheduler.step()
@@ -632,7 +682,9 @@ class OnePrompt(Prompt):
                 memory.router_prototypes = router_protos
                 memory.input_prototypes = input_protos
                 # 预计算 router prototypes 的 pairwise 相似度（供 compute_key_relation_loss 使用）
-                router_probs = F.softmax(router_protos, dim=-1)
+                # v2: 使用 key_temperature 保持与训练时一致
+                key_temp = v1.get("key_temperature", 2.0)
+                router_probs = F.softmax(router_protos / key_temp, dim=-1)
                 memory.router_pairwise_sim = router_probs @ router_probs.T
             except Exception as e:
                 print(f"[v1] Warning: Failed to save router prototypes: {e}")
@@ -658,11 +710,36 @@ class OnePrompt(Prompt):
                     all_grads.append(grad_vec)
 
                 if all_grads:
-                    grad_matrix = torch.stack(all_grads, dim=0)
-                    major_subspace, r = estimate_global_major_subspace(grad_matrix)
+                    # ── v2: 增量式子空间估计 ──
+                    if self._subspace_estimator is None:
+                        self._subspace_estimator = IncrementalSubspaceEstimator(
+                            buffer_size=200,
+                            min_rank=5,
+                            explained_var_threshold=0.95,
+                        )
+                    # 将当前任务的梯度快照追加到跨任务缓冲区
+                    self._subspace_estimator.add_snapshots(all_grads)
+
+                    # 对累积的跨任务梯度快照做 SVD
+                    major_subspace, r, S, explained_var = \
+                        self._subspace_estimator.estimate_subspace()
                     memory.global_major_subspace = major_subspace
-                    memory.grad_matrix = grad_matrix
-                    print(f"[v1] Estimated global major subspace: d={grad_matrix.size(1)}, r={r}")
+                    memory.grad_matrix = torch.stack(all_grads, dim=0)  # 保留当前任务矩阵供参考
+                    print(f"[v1] Estimated global major subspace: "
+                          f"d={major_subspace.size(0)}, r={r}, "
+                          f"buffer_size={self._subspace_estimator.num_snapshots}")
+
+                    # v2: 记录 SVD 奇异值谱
+                    if self._diag_logger is not None:
+                        self._diag_logger.log_svd_spectrum(
+                            task_id=self.task_count,
+                            singular_values=S,
+                            explained_var_ratio=explained_var,
+                            r=r,
+                            grad_matrix_shape=(self._subspace_estimator.num_snapshots,
+                                               major_subspace.size(0)),
+                            method="incremental_ema",
+                        )
             except Exception as e:
                 print(f"[v1] Warning: Failed to estimate gradient subspace: {e}")
 
@@ -671,6 +748,13 @@ class OnePrompt(Prompt):
             try:
                 usage_freq = save_expert_usage_freqs(self.model, train_loader, device)
                 memory.expert_usage_freq = usage_freq
+
+                # v2: 记录 expert 频率分布
+                if self._diag_logger is not None:
+                    self._diag_logger.log_expert_freqs(
+                        task_id=self.task_count,
+                        usage_freqs=usage_freq,
+                    )
             except Exception as e:
                 print(f"[v1] Warning: Failed to save expert usage freqs: {e}")
 
@@ -689,6 +773,31 @@ class OnePrompt(Prompt):
         self.old_memories.append(memory)
         print(f"[v1] Task {self.task_count} memory saved. "
               f"Total old memories: {len(self.old_memories)}")
+
+        # ── v2: 记录 key pairwise 相似度距离（新 memory vs 旧 memories）──
+        if self._diag_logger is not None and memory.router_pairwise_sim is not None:
+            try:
+                # 对每个旧 memory（不包括刚保存的），计算当前参数下的 pairwise sim 距离
+                for old_mem in self.old_memories[:-1]:  # exclude the just-saved one
+                    if old_mem.input_prototypes is None:
+                        continue
+                    cur_logits = prompt.get_router_logits_from_input_repr(
+                        old_mem.input_prototypes.to(device)
+                    )
+                    key_temp = v1.get("key_temperature", 2.0)
+                    cur_probs = F.softmax(cur_logits / key_temp, dim=-1)
+                    cur_sim = cur_probs @ cur_probs.T
+                    old_sim = old_mem.router_pairwise_sim.to(cur_logits.device)
+                    dist = compute_key_sim_distance(cur_sim, old_sim)
+                    self._diag_logger.log_key_sim_distance(
+                        task_id=self.task_count,
+                        mem_task_id=old_mem.task_id,
+                        frob_distance=dist["frob"],
+                        max_element_diff=dist["max"],
+                        mean_element_diff=dist["mean"],
+                    )
+            except Exception as e:
+                print(f"[v1] Warning: Failed to compute key sim distances: {e}")
 
 
 # @inproceedings{smith2023coda,

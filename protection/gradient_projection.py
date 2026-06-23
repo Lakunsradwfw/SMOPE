@@ -9,6 +9,11 @@
     - 低频 expert → 投影系数接近 0（几乎不约束）
   ❌ 放弃 per-expert 独立 SVD
 
+v2 改进（P1）:
+  - IncrementalSubspaceEstimator: 跨任务累积梯度快照，增量式 SVD
+  - 最小秩约束: min_rank 防止 r=1 退化
+  - 跨任务梯度多样性: 每任务追加梯度快照而非仅保留最新
+
 原理：
   对 expert i：
     g_i ← g_i - α_i · P_major(g_i)
@@ -19,10 +24,103 @@
 
 import torch
 import torch.nn as nn
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Deque
+from collections import deque
 
 from .task_memory import TaskMemory
 
+
+# ═══════════════════════════════════════════════════════════════
+# v2: Incremental Subspace Estimator
+# ═══════════════════════════════════════════════════════════════
+
+class IncrementalSubspaceEstimator:
+    """
+    增量式梯度子空间估计器（P1）。
+
+    维护一个跨任务的梯度快照缓冲区，每任务结束后追加当前任务的梯度快照。
+    定期（或按需）对累积的梯度矩阵做 SVD，克服单任务梯度 r=1 的退化问题。
+
+    Attributes:
+        buffer_size: 最大保留的梯度快照数
+        grad_snapshots: List of gradient vectors [d_total]
+        min_rank: 保留的最小秩（防止 r=1 退化）
+        explained_var_threshold: 解释方差阈值
+    """
+
+    def __init__(
+        self,
+        buffer_size: int = 200,
+        min_rank: int = 5,
+        explained_var_threshold: float = 0.95,
+    ):
+        self.buffer_size = buffer_size
+        self.min_rank = min_rank
+        self.explained_var_threshold = explained_var_threshold
+        self.grad_snapshots: List[torch.Tensor] = []
+
+    def add_snapshots(self, grad_vecs: List[torch.Tensor]):
+        """
+        追加梯度快照到缓冲区。超过 buffer_size 时移除最旧的。
+
+        Args:
+            grad_vecs: 梯度向量列表，每个 [d_total]
+        """
+        for g in grad_vecs:
+            if g.numel() == 0:
+                continue
+            # 存储到 CPU 以节省显存
+            self.grad_snapshots.append(g.detach().cpu())
+        # FIFO eviction
+        while len(self.grad_snapshots) > self.buffer_size:
+            self.grad_snapshots.pop(0)
+
+    def estimate_subspace(self) -> Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]:
+        """
+        对累积的梯度快照做 SVD，返回 major subspace。
+
+        Returns:
+            major_subspace: [d_total, r] major subspace 基向量
+            r: 保留的秩
+            singular_values: S（所有奇异值）
+            explained_var: 累积解释方差
+        """
+        if len(self.grad_snapshots) < 2:
+            d = self.grad_snapshots[0].size(0) if self.grad_snapshots else 1
+            return torch.zeros(d, 1), 1, torch.zeros(1), torch.zeros(1)
+
+        # 堆叠为矩阵 [N_snapshots, d_total]
+        G = torch.stack(self.grad_snapshots, dim=0).float()
+
+        # 中心化（减去均值），使 SVD 捕获变化方向而非均值方向
+        G_mean = G.mean(dim=0, keepdim=True)
+        G_centered = G - G_mean
+
+        # 使用随机 SVD 加速（当 N 和 d 都较大时）
+        if min(G_centered.shape) > 100:
+            _, S, Vh = _randomized_svd(G_centered)
+        else:
+            _, S, Vh = torch.linalg.svd(G_centered, full_matrices=False)
+
+        # 计算累积解释方差
+        total_var = torch.sum(S ** 2)
+        explained_var = torch.cumsum(S ** 2, dim=0) / (total_var + 1e-10)
+        r = torch.searchsorted(explained_var, self.explained_var_threshold).item() + 1
+        r = max(r, self.min_rank)  # v2: 最小秩约束
+        r = min(r, Vh.size(0))     # 不超过可用维度
+
+        major_subspace = Vh[:r, :].T.contiguous()  # [d_total, r]
+
+        return major_subspace, r, S, explained_var
+
+    @property
+    def num_snapshots(self) -> int:
+        return len(self.grad_snapshots)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Core functions
+# ═══════════════════════════════════════════════════════════════
 
 def collect_expert_gradients(model) -> torch.Tensor:
     """
@@ -57,6 +155,7 @@ def estimate_global_major_subspace(
     grad_matrix: torch.Tensor,
     explained_var_threshold: float = 0.95,
     use_randomized_svd: bool = False,
+    min_rank: int = 5,
 ) -> Tuple[torch.Tensor, int]:
     """
     通过 SVD 估计全局 major subspace。
@@ -65,6 +164,7 @@ def estimate_global_major_subspace(
         grad_matrix: [N_samples, d_total] 梯度矩阵
         explained_var_threshold: 保留的方差比例阈值
         use_randomized_svd: 是否使用随机 SVD 近似
+        min_rank: 最小保留秩（v2: 防止 r=1 退化）
 
     Returns:
         major_subspace: [d_total, r] 保留的 major subspace 基向量
@@ -76,15 +176,20 @@ def estimate_global_major_subspace(
     # 转换为 float32 以避免数值问题
     G = grad_matrix.float()
 
+    # 中心化，使 SVD 捕获变化方向
+    G_mean = G.mean(dim=0, keepdim=True)
+    G_centered = G - G_mean
+
     # SVD 分解
-    if use_randomized_svd and min(G.shape) > 100:
-        U, S, Vh = _randomized_svd(G)
+    if use_randomized_svd and min(G_centered.shape) > 100:
+        U, S, Vh = _randomized_svd(G_centered)
     else:
-        U, S, Vh = torch.linalg.svd(G, full_matrices=False)
+        U, S, Vh = torch.linalg.svd(G_centered, full_matrices=False)
 
     # 计算累积解释方差
-    explained_var = torch.cumsum(S ** 2, dim=0) / torch.sum(S ** 2)
+    explained_var = torch.cumsum(S ** 2, dim=0) / (torch.sum(S ** 2) + 1e-10)
     r = torch.searchsorted(explained_var, explained_var_threshold).item() + 1
+    r = max(r, min_rank)  # v2: 最小秩约束，防止 r=1 退化
     r = min(r, Vh.size(0))  # 不超过可用维度
 
     # major subspace 基向量: Vh[:r, :].T → [d_total, r]

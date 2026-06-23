@@ -27,6 +27,7 @@ from .task_memory import TaskMemory
 def compute_key_relation_loss(
     current_router_logits_fn,
     old_memories: List[TaskMemory],
+    temperature: float = 2.0,
 ) -> torch.Tensor:
     """
     约束旧任务 router logits 之间的 pairwise 相似度结构不被破坏。
@@ -34,13 +35,16 @@ def compute_key_relation_loss(
     L_key_rel = Σ_t || S_t - Ŝ_t ||_F²
 
     其中：
-      S_t = softmax(K_t) @ softmax(K_t)^T（旧 router prototype 的 pairwise 相似度矩阵）
-      Ŝ_t = softmax(K̂_t) @ softmax(K̂_t)^T（当前参数下 router logits 的 pairwise 相似度）
+      S_t = softmax(K_t/T) @ softmax(K_t/T)^T（旧 router prototype 的 pairwise 相似度矩阵）
+      Ŝ_t = softmax(K̂_t/T) @ softmax(K̂_t/T)^T（当前参数下 router logits 的 pairwise 相似度）
+
+    v2: 添加 temperature 参数软化相似度矩阵，避免过于尖锐的约束。
 
     Args:
         current_router_logits_fn: callable(task_id) -> router_logits [C_t, K]
             给定 task_id，返回当前参数下该任务的 per-class router logits
         old_memories: 旧任务 TaskMemory 列表
+        temperature: softmax 温度参数（>1 软化，<1 锐化）。推荐 2.0。
 
     Returns:
         key relation distillation loss（标量）
@@ -61,11 +65,12 @@ def compute_key_relation_loss(
         if cur_logits is None or cur_logits.numel() == 0:
             continue
 
-        # 当前 pairwise 相似度（使用 softmax 概率）
-        cur_probs = F.softmax(cur_logits, dim=-1)  # [C_t, K]
+        # 当前 pairwise 相似度（使用带温度的 softmax 概率）
+        cur_probs = F.softmax(cur_logits / temperature, dim=-1)  # [C_t, K]
         cur_sim = cur_probs @ cur_probs.T  # [C_t, C_t]
 
-        # 旧 pairwise 相似度（已保存）
+        # 旧 pairwise 相似度（已保存，也需要用同样温度重新计算以保持一致性）
+        # 注意：保存时的 S_t 也需要用相同温度计算
         old_sim = mem.router_pairwise_sim.to(cur_logits.device)  # [C_t, C_t]
 
         # MSE between pairwise similarity matrices

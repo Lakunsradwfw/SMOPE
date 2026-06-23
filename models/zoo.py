@@ -411,15 +411,17 @@ class OnePrompt(nn.Module):
         return list(groups.values())
 
     def get_v1_config(self):
-        """返回 v1 保护机制所需的超参数默认值（v1 已启用）"""
+        """返回 v1 保护机制所需的超参数默认值（v2 优化后的推荐值）"""
         return {
-            "lambda_router": 0.1,   # Router KL 散度权重
-            "lambda_key": 0.5,      # Key Relation Distillation 权重
-            "lambda_proto": 0.05,   # Prototype Alignment 权重
+            "lambda_router": 0.01,  # Router KL 散度权重（v2: 0.1→0.01，降低过度约束）
+            "lambda_key": 0.05,     # Key Relation Distillation 权重（v2: 0.5→0.05）
+            "lambda_proto": 0.01,   # Prototype Alignment 权重（v2: 0.05→0.01）
             "freq_threshold": 0.1,  # Expert 使用频率阈值
             "use_grad_projection": True,    # 是否启用梯度投影
             "use_alternating_update": True, # 是否启用交替更新
             "temperature": 1.0,     # KL 散度温度
+            "key_temperature": 2.0, # Key Relation 温度参数（v2 新增）
+            "enable_diagnostic_log": True,  # 是否启用分项 loss 诊断日志（v2 新增）
         }
 
 
