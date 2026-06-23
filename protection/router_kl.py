@@ -51,11 +51,17 @@ def compute_router_kl_loss(
         if old_logits.device != input_protos.device:
             old_logits = old_logits.to(input_protos.device)
 
+        # 当前分布：用当前 router 参数对 input_prototypes 计算 logits
+        cur_logits = current_router_logits_fn(input_protos)  # [num_classes, K]
+
+        # 将 old_logits 移到与 cur_logits 相同设备（input_protos 存于 CPU，
+        # 而 current_router_logits_fn 内部会将其移至模型设备，导致设备不一致）
+        old_logits = old_logits.to(cur_logits.device)
+
         # 旧分布：router logits prototype → softmax
         old_probs = F.softmax(old_logits / temperature, dim=-1)
 
-        # 当前分布：用当前 router 参数对 input_prototypes 计算 logits
-        cur_logits = current_router_logits_fn(input_protos)  # [num_classes, K]
+        # 当前分布
         cur_probs = F.softmax(cur_logits / temperature, dim=-1)
 
         # KL(P_old || P_cur) = Σ P_old * (log P_old - log P_cur)
@@ -95,6 +101,7 @@ def compute_router_l2_loss(
             old_logits = old_logits.to(input_protos.device)
 
         cur_logits = current_router_logits_fn(input_protos)
+        old_logits = old_logits.to(cur_logits.device)
         l2 = F.mse_loss(cur_logits, old_logits)
         total_l2 += l2
         count += 1
