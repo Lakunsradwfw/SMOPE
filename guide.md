@@ -285,15 +285,139 @@ SMoPE/
 
 ---
 
+### 2.7 v3 版本优化记录（2025-07-15）
+
+> **版本**：v3 — 直接权重空间正则 + 特征蒸馏
+> **状态**：已实现，默认启用（三组件全部重写）
+> **分支**：`v3`
+
+#### 2.7.1 v2 训练数据分析
+
+在 CIFAR-100 10-task 上训练 v2（5 repeats × 2 实验），与原始 SMoPE baseline 对比：
+
+| 实验 | FAA | CAA | FR | Δ FAA |
+|------|-----|-----|-----|-------|
+| Baseline (guide.md) | 88.88 | 92.78 | 4.30 | — |
+| v2 Exp1 (5 trials) | 88.83 | 92.78 | 4.06 | **-0.05** |
+| v2 Exp2 (5 trials) | 88.83 | 92.81 | 4.06 | **-0.05** |
+
+**诊断日志关键发现**（基于 `lossoutput.log` 845 个采样点的分析）：
+
+| # | 现象 | 根因 | 影响 |
+|---|------|------|------|
+| 1 | **所有保护损失恒为零** | 组件一 KL ≈ 0（router 自然稳定），退化 L2 也 ≈ 0 | 三个组件对训练无任何正则化作用 |
+| 2 | **梯度维度塌缩** 230400→110 | T2 起 `collect_expert_gradients` 只收集到 110 维 | 组件二 SVD 在错误空间投影，可能损坏梯度 |
+| 3 | 702/845 batch KL 退化到 L2 | `compute_router_kl_with_fallback` 全覆盖 | 组件一退化为几乎零损失的 L2 |
+
+**根因分析**：三个组件都在保护 **router 的输出行为**（logits、pairwise 相似度、梯度子空间），但 router（e_pk 参数 [1, 64] per expert）极其稳定——一旦训练完成几乎不漂移。保护不漂移的对象自然产生零损失。而真正导致遗忘的 **e_pv（expert value）参数漂移**完全未被约束。
+
+#### 2.7.2 修改的现有文件
+
+| 文件 | 变更内容 |
+|------|---------|
+| `protection/router_kl.py` | **重写**：删除 `compute_router_kl_loss` / `compute_router_kl_with_fallback`（KL + fallback）；新增 `save_pk_weights()` 保存 e_pk 参数快照、`compute_pk_l2_reg()` 计算 usage-frequency-weighted L2 正则、`save_pv_proto_outputs()` 保存 e_pv 输出特征（→ 组件三）、`_compute_pv_features()` 内部辅助函数 |
+| `protection/gradient_projection.py` | **重写**：删除 SVD 全链路（`IncrementalSubspaceEstimator` 变空壳、`estimate_global_major_subspace` / `project_gradients_to_minor_subspace` 标记废弃）；新增 `save_pv_weights()` 保存 e_pv 参数快照、`compute_pv_l2_reg()` 计算 usage-frequency-weighted L2 正则（**主保护**）；`collect_expert_gradients` 保留但加维度断言 |
+| `protection/key_relation.py` | **重写**：删除 `compute_key_relation_loss` / `compute_prototype_alignment_loss`（pairwise 相似度）；新增 `compute_feature_distill_loss()` 对旧类 prototype 的 e_pv 输出特征做 MSE 蒸馏 |
+| `protection/loss_logger.py` | **更新**：`log_losses()` 标签改为 `L_pk`/`L_pv`/`L_feat`；新增 `log_task_finish()` 记录权重漂移 + 特征漂移；新增 `compute_weight_drift()` / `compute_feature_drift_for_memory()` 便捷函数；`log_svd_spectrum` / `log_key_sim_distance` 标记废弃 |
+| `protection/task_memory.py` | **更新**：新增 `pk_snapshot`（dict）、`pv_snapshot`（dict）、`pv_proto_outputs`（tensor）字段；`global_major_subspace` / `grad_matrix` 保留但不再填充 |
+| `protection/__init__.py` | **更新**：导出新符号 `save_pk_weights`, `save_pv_proto_outputs`, `compute_pk_l2_reg`, `save_pv_weights`, `compute_pv_l2_reg`, `compute_feature_distill_loss`；移除旧导出 |
+| `learners/prompt.py` | **重写**：`update_model()` 删除交替更新（freeze/unfreeze 逻辑）、删除 Router KL / Prototype Alignment / Key Relation 相关代码；改为单一 backward pass 计算 `L_total = L_ce + λ_pk·L_pk + λ_pv·L_pv + λ_feat·L_feat`；`_on_task_finish()` 删除 SVD 梯度估计、删除 key sim 距离计算；改为保存 e_pk/e_pv 权重快照、e_pv proto outputs、诊断日志（权重漂移 + 特征漂移） |
+| `models/zoo.py` | **更新**：`get_v1_config()` 返回值改为 `lambda_pk=0.01`, `lambda_pv=0.05`, `lambda_feat=0.01`；移除 `lambda_router` / `lambda_key` / `lambda_proto` / `use_grad_projection` / `use_alternating_update` |
+
+#### 2.7.3 组件实现细节
+
+**P0 — 组件一重写：e_pk 权重空间 L2 正则** (`protection/router_kl.py`)
+
+- `save_pk_weights(prompt)`: 遍历所有 `e_pk` 参数，保存 `.detach().cpu().clone()` 到 dict
+- `compute_pk_l2_reg(prompt, old_memories)`: 
+  - 对每个旧任务的 pk_snapshot，计算 `weight · MSE(p_cur, p_old)`
+  - 权重由 `_get_pk_expert_weight()` 解析参数名中的 expert 索引，查 usage_freq 得到
+  - `freq_threshold=0` 表示全部 expert 都约束（按频率加权）
+  - 返回值除以参数数量做归一化
+- `_compute_pv_features(prompt, x_query)`: 计算所有 expert 的 query @ e_pv 点积（供组件三使用）
+
+**P1 — 组件二重写：e_pv 权重空间 L2 正则** (`protection/gradient_projection.py`)
+
+- `save_pv_weights(prompt)`: 遍历所有 `e_pv` 参数保存快照
+- `compute_pv_l2_reg(prompt, old_memories)`: 与组件一结构相同，作用于 e_pv
+- 这是 v3 的**核心保护机制**：直接约束高频 expert 的 value 参数不漂移
+- `save_expert_usage_freqs()` 保留不变
+
+**P2 — 组件三重写：e_pv 特征蒸馏** (`protection/key_relation.py`)
+
+- `compute_feature_distill_loss(prompt, old_memories)`:
+  - 对每个旧任务，取出保存的 `pv_proto_outputs`（各类 prototype 的 e_pv 输出特征）
+  - 用当前 e_pv 参数重新计算同类 prototype 的特征 → MSE
+  - 与组件二互补：组件二约束参数空间，组件三约束功能空间
+- `save_pv_proto_outputs(model, dataloader)`: 通过 ViT patch_embed + `_compute_pv_features` 计算 per-class 均值特征
+  - 处理 DataParallel 包装：`_model = model.module if hasattr(model, 'module') else model`
+
+#### 2.7.4 超参数变更对照
+
+| 超参数 | v2 默认值 | v3 默认值 | 说明 |
+|--------|----------|----------|------|
+| `lambda_router` | 0.01 | — **移除** | 替换为 `lambda_pk` |
+| `lambda_pk` | — | **0.01** | 新增：e_pk 权重空间 L2 正则权重 |
+| `lambda_key` | 0.05 | — **移除** | 替换为 `lambda_pv` |
+| `lambda_pv` | — | **0.05** | 新增：e_pv 权重空间 L2 正则权重（主保护） |
+| `lambda_proto` | 0.01 | — **移除** | 替换为 `lambda_feat` |
+| `lambda_feat` | — | **0.01** | 新增：e_pv 特征蒸馏权重 |
+| `freq_threshold` | 0.1 | **0.0** | 改为 0（全部 expert 按频率加权约束） |
+| `use_grad_projection` | True | — **移除** | 梯度投影已废弃 |
+| `use_alternating_update` | True | — **移除** | 交替更新已废弃（单一 backward pass） |
+| `key_temperature` | 2.0 | 2.0 | 保留兼容 |
+| `enable_diagnostic_log` | True | True | 不变 |
+
+#### 2.7.5 v3 训练期数据流
+
+```
+每个 batch:
+  L_ce → L_pk (freq-weighted e_pk L2) → L_pv (freq-weighted e_pv L2)
+  → L_feat (e_pv feature distill on old prototypes)
+  → total_loss.backward() → optimizer.step()
+  → DiagnosticLogger.log_losses(L_ce, L_pk, L_pv, L_feat, L_total)
+
+每个 task 完成:
+  save_pk_weights() → memory.pk_snapshot
+  save_pv_weights() → memory.pv_snapshot
+  save_router_prototypes() → memory.input_prototypes
+  save_pv_proto_outputs() → memory.pv_proto_outputs
+  save_expert_usage_freqs() → memory.expert_usage_freq
+  → DiagnosticLogger.log_expert_freqs()
+  → compute_weight_drift(pk, pv) → DiagnosticLogger.log_task_finish(pk_drift, pv_drift, feat_drifts)
+```
+
+#### 2.7.6 已知限制 & 后续改进
+
+| 限制 | 等级 | 计划 |
+|------|------|------|
+| `_compute_pv_features` 使用全部 expert 而非 top-K，与 SMoPE 实际 prompt attention 计算不完全一致 | 低 | 组件二（权重 L2）是主保护，组件三是辅助；如需精确，可改为保存 CLS token |
+| λ 超参数为手动设定，未做 grid search | 中 | v4: Bayesian optimization 或每个 λ 做 sweep |
+| `compute_pk_l2_reg` / `compute_pv_l2_reg` 每 batch 遍历所有旧任务的每个参数，旧任务多时开销增大 | 中 | 合并旧任务快照（running average）或每 N batch 计算一次 |
+| 权重漂移诊断在任务完成时遍历所有参数，大模型下耗时 | 低 | 采样部分参数或异步计算 |
+| 未接入 YAML 配置文件 | 低 | 后续接入 config yaml + CLI args |
+
+#### 2.7.7 启用方式
+
+```python
+# v3 默认启用（lambda_pk=0.01, lambda_pv=0.05, lambda_feat=0.01）
+# 修改超参数：编辑 models/zoo.py 中 OnePrompt.get_v1_config() 的返回值
+# 或在 learner 初始化后动态设置：
+# learner._v1_config["lambda_pv"] = 0.1
+# learner._v1_config["lambda_feat"] = 0.0  # 关闭组件三
+```
+
+---
+
 ## 3. 统一设计原则：Activation-Weighted Stability-Plasticity Trade-off
 
-> 每个参数子空间（router / expert / key）的保护强度与其在旧任务中的**激活频率**成正比。
+> v3 更新：每个参数子空间的保护强度与其在旧任务中的**激活频率**成正比。
 
-| 参数类型 | 保护机制 | 强度控制 |
-|---------|---------|---------|
-| Router logits | KL 散度正则 | 旧类 prototype 的置信度加权 |
-| Expert MLP / Prompt | 梯度投影到 minor subspace | 旧任务 expert 使用频率 → projection strength |
-| Key / Prototype | Relation Distillation Loss | 旧任务类间距离的稳定性加权 |
+| 参数类型 | 保护机制（v3） | 强度控制 |
+|---------|---------------|---------|
+| Expert Key (e_pk) | 权重空间 L2 正则 | 旧任务 expert 使用频率 → L2 权重 |
+| Expert Value (e_pv) | 权重空间 L2 正则 + 特征蒸馏 | 旧任务 expert 使用频率 → L2 权重 |
+| Prompt Features | e_pv 特征蒸馏（function space） | 旧任务各类 prototype 等权约束 |
 
 ---
 
@@ -813,6 +937,7 @@ SMOPE/
 
 ---
 
-> **最后更新**：2025-07-15（v2 优化完成）
+> **最后更新**：2025-07-15（v3 优化完成）
 > **下次对话**：读取本文件即可恢复全部上下文，无需重复描述项目背景。
-> **当前版本**：v2 — 诊断日志 + NaN 修复 + 增量 SVD + 温度软化；默认启用，超参数已优化。
+> **当前版本**：v3 — 直接权重空间 L2 正则 + 特征蒸馏；三组件全部重写；默认启用。
+> **分支**：`v3`
