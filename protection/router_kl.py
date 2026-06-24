@@ -19,10 +19,8 @@ import os
 
 from .task_memory import TaskMemory
 
-# ── 节流：Router KL 回退消息（避免每个 batch 都刷屏）──
-_fallback_msg_count = 0
-_fallback_msg_limit = 1  # 只打印第一条，后续静默计数
-_fallback_log_path = None  # 可选：写入单独的文件而非 stdout
+# ── Router KL 回退消息：同时打印到 stdout 并追加到独立日志文件 ──
+_fallback_log_path = "outputs/cifar-100/10-task/one-prompt/kl_fallback.log"
 
 
 def compute_router_kl_loss(
@@ -144,9 +142,15 @@ def compute_router_kl_with_fallback(
     current_router_logits_fn,
     old_memories: List[TaskMemory],
     temperature: float = 1.0,
+    task_id: int = -1,
+    epoch: int = -1,
+    batch: int = -1,
 ) -> tuple:
     """
     带自动退化的 Router KL 损失：先尝试 KL 散度，如果失败则退化为 L2。
+
+    Args:
+        task_id, epoch, batch: 可选，用于日志上下文
 
     Returns:
         (loss, fallback_used: str)
@@ -168,25 +172,29 @@ def compute_router_kl_with_fallback(
     if torch.isnan(l2_loss) or torch.isinf(l2_loss):
         return torch.tensor(0.0), "none"
 
-    global _fallback_msg_count, _fallback_msg_limit, _fallback_log_path
-    _fallback_msg_count += 1
+    global _fallback_log_path
 
-    msg = (f"[v1] INFO: Router KL degraded to L2 (KL was "
+    # 构建上下文前缀
+    ctx_parts = []
+    if task_id >= 0:
+        ctx_parts.append(f"T{task_id}")
+    if epoch >= 0:
+        ctx_parts.append(f"E{epoch}")
+    if batch >= 0:
+        ctx_parts.append(f"B{batch}")
+    ctx = "[" + " ".join(ctx_parts) + "] " if ctx_parts else ""
+
+    msg = (f"{ctx}[v1] INFO: Router KL degraded to L2 (KL was "
            f"{kl_loss.item() if not torch.isnan(kl_loss) else 'NaN'})")
 
-    # 如果配置了单独的 fallback 日志文件，始终追加到该文件
+    # 始终打印到 stdout
+    print(msg)
+
+    # 追加到独立的 fallback 日志文件
     if _fallback_log_path is not None:
         os.makedirs(os.path.dirname(_fallback_log_path), exist_ok=True)
         with open(_fallback_log_path, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
-
-    # 向 stdout 只打印前 _fallback_msg_limit 条
-    if _fallback_msg_count <= _fallback_msg_limit:
-        print(msg)
-        if _fallback_msg_count == _fallback_msg_limit:
-            print(f"[v1] INFO: Further Router KL fallback messages suppressed "
-                  f"(already logged to lossoutput.log via DiagnosticLogger). "
-                  f"Set router_kl._fallback_msg_limit higher to see more.")
 
     return l2_loss, "l2"
 

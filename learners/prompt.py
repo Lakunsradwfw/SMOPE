@@ -359,6 +359,9 @@ class OnePrompt(Prompt):
                 router_logits_fn,
                 self.old_memories,
                 temperature=v1.get("temperature", 1.0),
+                task_id=self.task_count,
+                epoch=self._task_epoch_count,
+                batch=self._batch_count,
             )
             L_kl_val = L_kl_raw.detach().clone()
             if not torch.isnan(L_kl_raw) and not torch.isinf(L_kl_raw):
