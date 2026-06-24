@@ -15,8 +15,14 @@ v2 改进:
 import torch
 import torch.nn.functional as F
 from typing import List
+import os
 
 from .task_memory import TaskMemory
+
+# ── 节流：Router KL 回退消息（避免每个 batch 都刷屏）──
+_fallback_msg_count = 0
+_fallback_msg_limit = 1  # 只打印第一条，后续静默计数
+_fallback_log_path = None  # 可选：写入单独的文件而非 stdout
 
 
 def compute_router_kl_loss(
@@ -162,8 +168,26 @@ def compute_router_kl_with_fallback(
     if torch.isnan(l2_loss) or torch.isinf(l2_loss):
         return torch.tensor(0.0), "none"
 
-    print(f"[v1] INFO: Router KL degraded to L2 (KL was "
-          f"{kl_loss.item() if not torch.isnan(kl_loss) else 'NaN'})")
+    global _fallback_msg_count, _fallback_msg_limit, _fallback_log_path
+    _fallback_msg_count += 1
+
+    msg = (f"[v1] INFO: Router KL degraded to L2 (KL was "
+           f"{kl_loss.item() if not torch.isnan(kl_loss) else 'NaN'})")
+
+    # 如果配置了单独的 fallback 日志文件，始终追加到该文件
+    if _fallback_log_path is not None:
+        os.makedirs(os.path.dirname(_fallback_log_path), exist_ok=True)
+        with open(_fallback_log_path, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+
+    # 向 stdout 只打印前 _fallback_msg_limit 条
+    if _fallback_msg_count <= _fallback_msg_limit:
+        print(msg)
+        if _fallback_msg_count == _fallback_msg_limit:
+            print(f"[v1] INFO: Further Router KL fallback messages suppressed "
+                  f"(already logged to lossoutput.log via DiagnosticLogger). "
+                  f"Set router_kl._fallback_msg_limit higher to see more.")
+
     return l2_loss, "l2"
 
 
