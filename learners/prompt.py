@@ -16,28 +16,32 @@ import torchvision
 from utils.schedulers import CosineSchedule, CosineSchedulerIter
 from torch.autograd import Variable, Function
 
-# ── v1: Heterogeneous Gradient Protection ──
+# ── v3: Direct Expert Parameter Protection ──
 import protection
 from protection.task_memory import TaskMemory
 from protection.router_kl import (
-    compute_router_kl_loss,
-    compute_router_kl_with_fallback,
-    compute_router_l2_loss,
     save_router_prototypes,
+    save_pk_weights,
+    save_pv_proto_outputs,
+    compute_pk_l2_reg,
 )
 from protection.gradient_projection import (
-    estimate_global_major_subspace,
-    project_gradients_to_minor_subspace,
-    collect_expert_gradients,
+    save_pv_weights,
+    compute_pv_l2_reg,
     save_expert_usage_freqs,
+    collect_expert_gradients,
     IncrementalSubspaceEstimator,
 )
 from protection.key_relation import (
-    compute_key_relation_loss,
-    compute_prototype_alignment_loss,
+    compute_feature_distill_loss,
     save_key_prototypes,
 )
-from protection.loss_logger import DiagnosticLogger, compute_key_sim_distance
+from protection.loss_logger import (
+    DiagnosticLogger,
+    compute_key_sim_distance,
+    compute_weight_drift,
+    compute_feature_drift_for_memory,
+)
 
 
 class Prompt(NormalNN):
@@ -188,8 +192,7 @@ class OnePrompt(Prompt):
         self._diag_logger: DiagnosticLogger = None  # lazy init in _init_v1_config
         self._batch_count = 0  # global batch counter for logging
         self._task_epoch_count = 0  # epoch counter within current task
-        # ── v2: Incremental Subspace Estimator (P1) ──
-        self._subspace_estimator: IncrementalSubspaceEstimator = None
+        # ── v3: no incremental subspace estimator needed ──
 
     def _init_v1_config(self):
         """初始化 v1 保护机制配置（从模型获取默认值）"""
@@ -200,12 +203,10 @@ class OnePrompt(Prompt):
             self._v1_config = prompt.get_v1_config()
         except Exception:
             self._v1_config = {
-                "lambda_router": 0.0,
-                "lambda_key": 0.0,
-                "lambda_proto": 0.0,
-                "freq_threshold": 0.1,
-                "use_grad_projection": False,
-                "use_alternating_update": False,
+                "lambda_pk": 0.0,
+                "lambda_pv": 0.0,
+                "lambda_feat": 0.0,
+                "freq_threshold": 0.0,
                 "temperature": 1.0,
                 "key_temperature": 2.0,
                 "enable_diagnostic_log": False,
@@ -293,143 +294,69 @@ class OnePrompt(Prompt):
             self.scheduler = CosineSchedulerIter(**scheduler_cfg)
 
     def update_model(self, inputs, targets, dense=False):
-        # ── v2: lazy init ──
+        # ── v3: lazy init ──
         self._init_v1_config()
         v1 = self._v1_config
         prompt = self.model.module.prompt if hasattr(self.model, 'module') else self.model.prompt
 
-        # ── v2: 构建 task_id → input_prototypes 查找表（供组件一、三使用）──
-        task_input_protos = {}
-        if self.old_memories:
-            for mem in self.old_memories:
-                if mem.input_prototypes is not None:
-                    task_input_protos[mem.task_id] = mem.input_prototypes
-
-        def make_router_logits_for_task_fn(_prompt, _task_input_protos, _device):
-            """闭包：返回给定 task_id 的当前 router logits [C_t, K]"""
-            def fn(task_id):
-                ip = _task_input_protos.get(task_id)
-                if ip is None:
-                    return None
-                return _prompt.get_router_logits_from_input_repr(ip.to(_device))
-            return fn
-
-        router_logits_for_task = make_router_logits_for_task_fn(
-            prompt, task_input_protos, inputs.device
-        )
-
-        # ═══════════════════════════════════════════════
-        # Step 1: CE Loss + v1 保护正则（key 冻结）
-        # ═══════════════════════════════════════════════
-        if v1.get("use_alternating_update", False) and self.old_memories:
-            prompt.freeze_keys()
-
-        # ── v2: 分离各 loss 分量用于诊断日志 ──
+        # ── v3: 分离各 loss 分量用于诊断日志 ──
         L_ce_val = torch.tensor(0.0, device=inputs.device)
-        L_kl_val = torch.tensor(0.0, device=inputs.device)
-        L_proto_val = torch.tensor(0.0, device=inputs.device)
-        L_key_val = torch.tensor(0.0, device=inputs.device)
-        kl_fallback = "none"
+        L_pk_val = torch.tensor(0.0, device=inputs.device)
+        L_pv_val = torch.tensor(0.0, device=inputs.device)
+        L_feat_val = torch.tensor(0.0, device=inputs.device)
 
         # logits
         logits, prompt_loss = self.model(
             inputs, train=True, cls_mean=self.cls_mean, dense=dense
-        )  # logits=cls_token if pen=True, else self.model.last(cls_token)
+        )
 
         logits = logits[:, : self.valid_out_dim]
 
         # ce with heuristic
-        logits[:, : self.last_valid_out_dim] = -float(
-            "inf"
-        )  # TODO: this gives inf loss if self.memory_size > 0
+        logits[:, : self.last_valid_out_dim] = -float("inf")
         dw_cls = self.dw_k[-1 * torch.ones(targets.size()).long()]
         total_loss = self.criterion(logits, targets.long(), dw_cls)
-
-        # ce loss
         total_loss = total_loss + prompt_loss.sum()
         L_ce_val = total_loss.detach().clone()
 
-        # ── v2 组件一：Router KL 散度正则（带自动 NaN→L2 退化）──
-        lambda_router = v1.get("lambda_router", 0.0)
-        if lambda_router > 0 and self.old_memories:
-            def router_logits_fn(input_protos):
-                return prompt.get_router_logits_from_input_repr(input_protos)
-
-            L_kl_raw, kl_fallback = compute_router_kl_with_fallback(
-                router_logits_fn,
-                self.old_memories,
-                temperature=v1.get("temperature", 1.0),
-                task_id=self.task_count,
-                epoch=self._task_epoch_count,
-                batch=self._batch_count,
+        # ── v3 组件一：e_pk 权重空间 L2 正则 ──
+        lambda_pk = v1.get("lambda_pk", 0.0)
+        if lambda_pk > 0 and self.old_memories:
+            L_pk = compute_pk_l2_reg(
+                prompt, self.old_memories,
+                freq_threshold=v1.get("freq_threshold", 0.0),
             )
-            L_kl_val = L_kl_raw.detach().clone()
-            if not torch.isnan(L_kl_raw) and not torch.isinf(L_kl_raw):
-                total_loss = total_loss + lambda_router * L_kl_raw
+            L_pk_val = L_pk.detach().clone()
+            if not torch.isnan(L_pk) and not torch.isinf(L_pk):
+                total_loss = total_loss + lambda_pk * L_pk
 
-        # ── v2 组件三前半：Prototype Alignment（L2 约束 router logits）──
-        lambda_proto = v1.get("lambda_proto", 0.0)
-        if lambda_proto > 0 and self.old_memories:
-            L_proto = compute_prototype_alignment_loss(
-                router_logits_for_task, self.old_memories
+        # ── v3 组件二：e_pv 权重空间 L2 正则 ──
+        lambda_pv = v1.get("lambda_pv", 0.0)
+        if lambda_pv > 0 and self.old_memories:
+            L_pv = compute_pv_l2_reg(
+                prompt, self.old_memories,
+                freq_threshold=v1.get("freq_threshold", 0.0),
             )
-            L_proto_val = L_proto.detach().clone()
-            if not torch.isnan(L_proto) and not torch.isinf(L_proto):
-                total_loss = total_loss + lambda_proto * L_proto
+            L_pv_val = L_pv.detach().clone()
+            if not torch.isnan(L_pv) and not torch.isinf(L_pv):
+                total_loss = total_loss + lambda_pv * L_pv
 
-        # step
+        # ── v3 组件三：e_pv 特征蒸馏 ──
+        lambda_feat = v1.get("lambda_feat", 0.0)
+        if lambda_feat > 0 and self.old_memories:
+            L_feat = compute_feature_distill_loss(
+                prompt, self.old_memories, device=inputs.device,
+            )
+            L_feat_val = L_feat.detach().clone()
+            if not torch.isnan(L_feat) and not torch.isinf(L_feat):
+                total_loss = total_loss + lambda_feat * L_feat
+
+        # Single backward pass (no alternating update)
         self.optimizer.zero_grad()
         total_loss.backward()
-
-        # ── v2 组件二：梯度投影到 Minor Subspace ──
-        if v1.get("use_grad_projection", False) and self.old_memories:
-            project_gradients_to_minor_subspace(
-                prompt,
-                self.old_memories,
-                freq_threshold=v1.get("freq_threshold", 0.1),
-            )
-
         self.optimizer.step()
 
-        # ═══════════════════════════════════════════════
-        # Step 2: Key Relation Distillation（key 解冻，expert 冻结）
-        # ═══════════════════════════════════════════════
-        lambda_key = v1.get("lambda_key", 0.0)
-        if (lambda_key > 0
-                and v1.get("use_alternating_update", False)
-                and self.old_memories):
-            prompt.unfreeze_keys()
-            prompt.freeze_experts()
-
-            # 使用一个独立的 key optimizer
-            key_params = []
-            for e in prompt.e_layers:
-                for l in range(prompt.num_experts):
-                    for h in range(prompt.num_heads):
-                        key_params.append(getattr(prompt, f"e_pk_{e}_{l}_{h}"))
-
-            key_optimizer = torch.optim.AdamW(
-                key_params,
-                lr=self.config["lr"] * 0.1,  # key 学习率更低
-                weight_decay=self.config["weight_decay"],
-            )
-
-            key_optimizer.zero_grad()
-
-            # v2: 使用温度参数软化相似度矩阵
-            L_key_rel = compute_key_relation_loss(
-                router_logits_for_task, self.old_memories,
-                temperature=v1.get("key_temperature", 2.0),
-            )
-            L_key_val = L_key_rel.detach().clone()
-            L_key_weighted = lambda_key * L_key_rel
-            if L_key_weighted.requires_grad and not torch.isnan(L_key_weighted):
-                L_key_weighted.backward()
-                key_optimizer.step()
-
-            prompt.unfreeze_experts()
-
-        # ── v2: 诊断日志记录 ──
+        # ── v3: 诊断日志记录 ──
         has_nan = (torch.isnan(total_loss) or torch.isinf(total_loss))
         if self._diag_logger is not None:
             self._diag_logger.log_losses(
@@ -437,12 +364,12 @@ class OnePrompt(Prompt):
                 epoch=self._task_epoch_count,
                 batch=self._batch_count,
                 l_ce=float(L_ce_val.item()) if not torch.isnan(L_ce_val).any() else float('nan'),
-                l_kl=float(L_kl_val.item()) if not torch.isnan(L_kl_val).any() else float('nan'),
-                l_key_rel=float(L_key_val.item()) if not torch.isnan(L_key_val).any() else float('nan'),
-                l_proto=float(L_proto_val.item()) if not torch.isnan(L_proto_val).any() else float('nan'),
+                l_kl=float(L_pk_val.item()) if not torch.isnan(L_pk_val).any() else float('nan'),
+                l_key_rel=float(L_pv_val.item()) if not torch.isnan(L_pv_val).any() else float('nan'),
+                l_proto=float(L_feat_val.item()) if not torch.isnan(L_feat_val).any() else float('nan'),
                 l_total=float(total_loss.detach().item()) if not has_nan else float('nan'),
                 has_nan=bool(has_nan),
-                fallback_used=kl_fallback if kl_fallback != "kl" else "",
+                fallback_used="",
             )
         self._batch_count += 1
 
@@ -642,25 +569,23 @@ class OnePrompt(Prompt):
     # ═══════════════════════════════════════════════════════════
     def _on_task_finish(self, train_loader):
         """
-        在每个任务训练完成后调用。
-        保存 router prototypes、gradient subspace、key prototypes 等信息。
+        v3: 在每个任务训练完成后保存约束信息。
+        保存 e_pk/e_pv 权重快照、input prototypes、e_pv proto outputs、expert 使用频率。
         """
         self._init_v1_config()
         v1 = self._v1_config
 
-        # 检查是否有任何 v1 保护机制启用
-        any_v1_enabled = (
-            v1.get("lambda_router", 0.0) > 0
-            or v1.get("lambda_key", 0.0) > 0
-            or v1.get("lambda_proto", 0.0) > 0
-            or v1.get("use_grad_projection", False)
+        # 检查是否有任何 v3 保护机制启用
+        any_v3_enabled = (
+            v1.get("lambda_pk", 0.0) > 0
+            or v1.get("lambda_pv", 0.0) > 0
+            or v1.get("lambda_feat", 0.0) > 0
         )
-        if not any_v1_enabled:
+        if not any_v3_enabled:
             return
 
         prompt = self.model.module.prompt if hasattr(self.model, 'module') else self.model.prompt
 
-        # 当前任务的类别数
         num_classes = self.valid_out_dim - self.last_valid_out_dim
         device = "cuda" if self.gpu else "cpu"
 
@@ -671,137 +596,97 @@ class OnePrompt(Prompt):
             device=device,
         )
 
-        # ── 组件一：保存 Router Prototype Distribution ──
-        # 注意：router_prototypes 和 input_prototypes 也被组件三（key_relation, proto_alignment）使用
-        need_router = (
-            v1.get("lambda_router", 0.0) > 0
-            or v1.get("lambda_key", 0.0) > 0
-            or v1.get("lambda_proto", 0.0) > 0
-        )
-        if need_router:
+        # ── v3 组件一：保存 e_pk 权重快照 ──
+        if v1.get("lambda_pk", 0.0) > 0:
+            try:
+                memory.pk_snapshot = save_pk_weights(prompt, device)
+                print(f"[v3] Saved e_pk snapshot: {len(memory.pk_snapshot)} params")
+            except Exception as e:
+                print(f"[v3] Warning: Failed to save e_pk weights: {e}")
+
+        # ── v3 组件二：保存 e_pv 权重快照 ──
+        if v1.get("lambda_pv", 0.0) > 0:
+            try:
+                memory.pv_snapshot = save_pv_weights(prompt, device)
+                print(f"[v3] Saved e_pv snapshot: {len(memory.pv_snapshot)} params")
+            except Exception as e:
+                print(f"[v3] Warning: Failed to save e_pv weights: {e}")
+
+        # ── v3 组件三：保存 input prototypes 和 e_pv proto outputs ──
+        need_feat = v1.get("lambda_feat", 0.0) > 0
+        need_freq = v1.get("lambda_pk", 0.0) > 0 or v1.get("lambda_pv", 0.0) > 0
+
+        if need_feat or need_freq:
             try:
                 router_protos, input_protos = save_router_prototypes(
                     self.model, train_loader, num_classes, device
                 )
                 memory.router_prototypes = router_protos
                 memory.input_prototypes = input_protos
-                # 预计算 router prototypes 的 pairwise 相似度（供 compute_key_relation_loss 使用）
-                # v2: 使用 key_temperature 保持与训练时一致
-                key_temp = v1.get("key_temperature", 2.0)
-                router_probs = F.softmax(router_protos / key_temp, dim=-1)
-                memory.router_pairwise_sim = router_probs @ router_probs.T
-            except Exception as e:
-                print(f"[v1] Warning: Failed to save router prototypes: {e}")
 
-        # ── 组件二：估计 Global Major Subspace ──
-        if v1.get("use_grad_projection", False):
-            try:
-                all_grads = []
-                for x, y, _ in train_loader:
-                    if self.gpu:
-                        x, y = x.cuda(), y.cuda()
-                    self.model.zero_grad()
-                    logits, prompt_loss = self.model(
-                        x, train=True, cls_mean=self.cls_mean
+                # v3 组件三：保存 e_pv 在各类 prototype 上的输出特征
+                if need_feat:
+                    from protection.router_kl import save_pv_proto_outputs
+                    pv_outputs = save_pv_proto_outputs(
+                        self.model, train_loader, num_classes, device
                     )
-                    logits = logits[:, : self.valid_out_dim]
-                    logits[:, : self.last_valid_out_dim] = -float("inf")
-                    dw_cls = self.dw_k[-1 * torch.ones(y.size()).long()]
-                    loss = self.criterion(logits, y.long(), dw_cls)
-                    loss = loss + prompt_loss.sum()
-                    loss.backward()
-                    grad_vec = collect_expert_gradients(prompt)
-                    all_grads.append(grad_vec)
-
-                if all_grads:
-                    # ── v2: 增量式子空间估计 ──
-                    if self._subspace_estimator is None:
-                        self._subspace_estimator = IncrementalSubspaceEstimator(
-                            buffer_size=200,
-                            min_rank=5,
-                            explained_var_threshold=0.95,
-                        )
-                    # 将当前任务的梯度快照追加到跨任务缓冲区
-                    self._subspace_estimator.add_snapshots(all_grads)
-
-                    # 对累积的跨任务梯度快照做 SVD
-                    major_subspace, r, S, explained_var = \
-                        self._subspace_estimator.estimate_subspace()
-                    memory.global_major_subspace = major_subspace
-                    memory.grad_matrix = torch.stack(all_grads, dim=0)  # 保留当前任务矩阵供参考
-                    print(f"[v1] Estimated global major subspace: "
-                          f"d={major_subspace.size(0)}, r={r}, "
-                          f"buffer_size={self._subspace_estimator.num_snapshots}")
-
-                    # v2: 记录 SVD 奇异值谱
-                    if self._diag_logger is not None:
-                        self._diag_logger.log_svd_spectrum(
-                            task_id=self.task_count,
-                            singular_values=S,
-                            explained_var_ratio=explained_var,
-                            r=r,
-                            grad_matrix_shape=(self._subspace_estimator.num_snapshots,
-                                               major_subspace.size(0)),
-                            method="incremental_ema",
-                        )
+                    memory.pv_proto_outputs = pv_outputs
+                    print(f"[v3] Saved e_pv proto outputs: {pv_outputs.shape}")
             except Exception as e:
-                print(f"[v1] Warning: Failed to estimate gradient subspace: {e}")
+                print(f"[v3] Warning: Failed to save prototypes: {e}")
 
-        # ── Expert 使用频率 ──
-        if v1.get("use_grad_projection", False):
+        # ── Expert 使用频率（组件一、二的加权依据）──
+        if need_freq:
             try:
                 usage_freq = save_expert_usage_freqs(self.model, train_loader, device)
                 memory.expert_usage_freq = usage_freq
 
-                # v2: 记录 expert 频率分布
                 if self._diag_logger is not None:
                     self._diag_logger.log_expert_freqs(
                         task_id=self.task_count,
                         usage_freqs=usage_freq,
                     )
             except Exception as e:
-                print(f"[v1] Warning: Failed to save expert usage freqs: {e}")
-
-        # ── 组件三：Key Prototypes & Pairwise Similarity ──
-        if v1.get("lambda_key", 0.0) > 0 or v1.get("lambda_proto", 0.0) > 0:
-            try:
-                key_protos, key_sim = save_key_prototypes(
-                    self.model, train_loader, num_classes, device
-                )
-                memory.key_prototypes = key_protos
-                memory.key_pairwise_sim = key_sim
-            except Exception as e:
-                print(f"[v1] Warning: Failed to save key prototypes: {e}")
+                print(f"[v3] Warning: Failed to save expert usage freqs: {e}")
 
         # 保存到 old_memories 列表
         self.old_memories.append(memory)
-        print(f"[v1] Task {self.task_count} memory saved. "
+        print(f"[v3] Task {self.task_count} memory saved. "
               f"Total old memories: {len(self.old_memories)}")
 
-        # ── v2: 记录 key pairwise 相似度距离（新 memory vs 旧 memories）──
-        if self._diag_logger is not None and memory.router_pairwise_sim is not None:
+        # ── v3: 诊断日志 — 权重漂移 ──
+        if self._diag_logger is not None:
             try:
-                # 对每个旧 memory（不包括刚保存的），计算当前参数下的 pairwise sim 距离
-                for old_mem in self.old_memories[:-1]:  # exclude the just-saved one
-                    if old_mem.input_prototypes is None:
-                        continue
-                    cur_logits = prompt.get_router_logits_from_input_repr(
-                        old_mem.input_prototypes.to(device)
-                    )
-                    key_temp = v1.get("key_temperature", 2.0)
-                    cur_probs = F.softmax(cur_logits / key_temp, dim=-1)
-                    cur_sim = cur_probs @ cur_probs.T
-                    old_sim = old_mem.router_pairwise_sim.to(cur_logits.device)
-                    dist = compute_key_sim_distance(cur_sim, old_sim)
-                    self._diag_logger.log_key_sim_distance(
-                        task_id=self.task_count,
-                        mem_task_id=old_mem.task_id,
-                        frob_distance=dist["frob"],
-                        max_element_diff=dist["max"],
-                        mean_element_diff=dist["mean"],
-                    )
+                pk_drift = 0.0
+                pv_drift = 0.0
+                if memory.pk_snapshot is not None and len(self.old_memories) >= 2:
+                    # 与上一个任务的快照比较（展示增量漂移）
+                    prev_mem = self.old_memories[-2]
+                    if prev_mem.pk_snapshot is not None:
+                        pk_drift = compute_weight_drift(prompt, prev_mem.pk_snapshot, "e_pk")
+                if memory.pv_snapshot is not None and len(self.old_memories) >= 2:
+                    prev_mem = self.old_memories[-2]
+                    if prev_mem.pv_snapshot is not None:
+                        pv_drift = compute_weight_drift(prompt, prev_mem.pv_snapshot, "e_pv")
+
+                # 特征漂移：评估当前 e_pv 在所有旧任务 prototype 上的漂移
+                feat_drifts = {}
+                if memory.pv_proto_outputs is not None:
+                    for old_mem in self.old_memories[:-1]:  # exclude just-saved
+                        if old_mem.pv_proto_outputs is not None and old_mem.input_prototypes is not None:
+                            fd = compute_feature_drift_for_memory(prompt, old_mem, device)
+                            feat_drifts[old_mem.task_id] = fd
+
+                self._diag_logger.log_task_finish(
+                    task_id=self.task_count,
+                    pk_drift=pk_drift,
+                    pv_drift=pv_drift,
+                    pk_snapshot_size=len(memory.pk_snapshot) if memory.pk_snapshot else 0,
+                    pv_snapshot_size=len(memory.pv_snapshot) if memory.pv_snapshot else 0,
+                    feat_drifts=feat_drifts if feat_drifts else None,
+                )
             except Exception as e:
-                print(f"[v1] Warning: Failed to compute key sim distances: {e}")
+                print(f"[v3] Warning: Failed to log task finish diagnostics: {e}")
 
 
 # @inproceedings{smith2023coda,

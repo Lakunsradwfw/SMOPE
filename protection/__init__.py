@@ -1,36 +1,51 @@
 """
-SMoPE v1 — Heterogeneous Gradient Protection Module
+SMoPE v3 — Direct Expert Parameter Protection Module
 
 Components:
-  1. Router KL Divergence Regularization (router_kl.py)
-  2. SplitLoRA-style Gradient Projection (gradient_projection.py)
-  3. Key Relation Distillation Loss (key_relation.py)
+  1. e_pk Weight-space L2 Regularization (router_kl.py)
+  2. e_pv Weight-space L2 Regularization (gradient_projection.py)
+  3. e_pv Feature Distillation (key_relation.py)
 
 Shared data structure:
   TaskMemory (task_memory.py)
+
+Diagnostics:
+  DiagnosticLogger (loss_logger.py)
 """
 
 from .task_memory import TaskMemory
-from .router_kl import compute_router_kl_loss, compute_router_kl_with_fallback
+from .router_kl import (
+    save_router_prototypes,
+    save_pk_weights,
+    save_pv_proto_outputs,
+    compute_pk_l2_reg,
+)
 from .gradient_projection import (
-    estimate_global_major_subspace,
-    project_gradients_to_minor_subspace,
+    save_pv_weights,
+    compute_pv_l2_reg,
+    save_expert_usage_freqs,
     collect_expert_gradients,
     IncrementalSubspaceEstimator,
 )
-from .key_relation import compute_key_relation_loss, compute_prototype_alignment_loss
+from .key_relation import (
+    compute_feature_distill_loss,
+    save_key_prototypes,
+)
 from .loss_logger import DiagnosticLogger, compute_key_sim_distance
 
 __all__ = [
     "TaskMemory",
-    "compute_router_kl_loss",
-    "compute_router_kl_with_fallback",
-    "estimate_global_major_subspace",
-    "project_gradients_to_minor_subspace",
+    "save_router_prototypes",
+    "save_pk_weights",
+    "save_pv_proto_outputs",
+    "compute_pk_l2_reg",
+    "save_pv_weights",
+    "compute_pv_l2_reg",
+    "save_expert_usage_freqs",
     "collect_expert_gradients",
     "IncrementalSubspaceEstimator",
-    "compute_key_relation_loss",
-    "compute_prototype_alignment_loss",
+    "compute_feature_distill_loss",
+    "save_key_prototypes",
     "DiagnosticLogger",
     "compute_key_sim_distance",
 ]

@@ -1,132 +1,88 @@
 """
-组件三：Key Relation Distillation Loss（Component 3: Key Relation Distillation）
+组件三：e_pv 特征蒸馏（Component 3: Feature Distillation on e_pv Outputs）
 
-遵循导师建议：
-  ✅ Key Relation Distillation Loss：
-    - 保存旧任务所有类的 router prototype 矩阵（per-class router logits 均值）
-    - 计算旧 router prototypes 之间的 pairwise 相似度矩阵 S_t
-    - 新任务训练时加 L_key_rel = ||S_t - Ŝ_t||_F²
-      （只约束相对几何结构，允许整体旋转/平移）
-  ✅ Alternating update 策略（避免梯度冲突）：
-    - Step 1: CE loss → 更新 expert/prompt/router（key 冻结）
-    - Step 2: Alignment loss → 更新 key（其他冻结）
-  ❌ 放弃「不改变最近邻关系」的不可计算约束
+v3 重构：放弃 Key Relation Distillation（v1/v2 中 pairwise 相似度恒不变，损失恒为零），
+        改为对 e_pv 在旧类 prototype 上的输出特征做蒸馏。
 
-v1 Fix: 由于 ViT 冻结，key query (cls_token) 不产生梯度。改为操作 router logits，
-      通过 e_pk 参数产生梯度。所有损失基于 stored input_prototypes 通过当前
-      e_pk 计算的 router logits。
+原理：
+  对每个旧任务，保存其各类 prototype 输入在 e_pv 上的输出特征 F_t。
+  新任务训练时：L_feat = Σ_t ||F̂_t - F_t||²
+  其中 F̂_t 是当前 e_pv 参数对旧类 prototype 的输出。
+
+  这直接保护了分类器所依赖的 prompt 特征空间不被破坏。
+
+  与组件二（e_pv 权重 L2）的互补关系：
+  - 组件二：约束 e_pv 参数绝对值不漂移（weight space）
+  - 组件三：约束 e_pv 在关键输入（旧类 prototype）上的行为不变（function space）
+  - 两者一起提供双层保护
+
+v2 遗留（已废弃但保留兼容）:
+  - compute_key_relation_loss: 标记废弃
+  - compute_prototype_alignment_loss: 标记废弃
+  - save_key_prototypes: 保留（仍被调用但主要数据由 router_kl.save_router_prototypes 提供）
 """
 
 import torch
 import torch.nn.functional as F
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from .task_memory import TaskMemory
 
 
-def compute_key_relation_loss(
-    current_router_logits_fn,
+# ═══════════════════════════════════════════════════════════════
+# v3: Feature Distillation on e_pv Outputs
+# ═══════════════════════════════════════════════════════════════
+
+def compute_feature_distill_loss(
+    prompt,
     old_memories: List[TaskMemory],
-    temperature: float = 2.0,
+    device: str = "cuda",
 ) -> torch.Tensor:
     """
-    约束旧任务 router logits 之间的 pairwise 相似度结构不被破坏。
+    对旧任务各类 prototype 输入，约束当前 e_pv 输出特征不偏离保存的特征。
 
-    L_key_rel = Σ_t || S_t - Ŝ_t ||_F²
-
-    其中：
-      S_t = softmax(K_t/T) @ softmax(K_t/T)^T（旧 router prototype 的 pairwise 相似度矩阵）
-      Ŝ_t = softmax(K̂_t/T) @ softmax(K̂_t/T)^T（当前参数下 router logits 的 pairwise 相似度）
-
-    v2: 添加 temperature 参数软化相似度矩阵，避免过于尖锐的约束。
+    L_feat = Σ_t ||pv_output_cur(input_protos_t) - pv_proto_outputs_saved_t||²
 
     Args:
-        current_router_logits_fn: callable(task_id) -> router_logits [C_t, K]
-            给定 task_id，返回当前参数下该任务的 per-class router logits
+        prompt: SMoPE prompt 模块
         old_memories: 旧任务 TaskMemory 列表
-        temperature: softmax 温度参数（>1 软化，<1 锐化）。推荐 2.0。
+        device: 计算设备
 
     Returns:
-        key relation distillation loss（标量）
+        特征蒸馏损失（标量）
     """
     if not old_memories:
-        return torch.tensor(0.0, requires_grad=False)
+        return torch.tensor(0.0, device=device)
 
-    total_loss = 0.0
+    # v3 fix: import at function top, not inside loop
+    from .router_kl import _compute_pv_features
+
+    total_loss = torch.tensor(0.0, device=device)
     count = 0
 
     for mem in old_memories:
-        if mem.router_pairwise_sim is None:
+        if mem.pv_proto_outputs is None or mem.input_prototypes is None:
             continue
 
-        # 当前 router logits for this task's classes
-        cur_logits = current_router_logits_fn(mem.task_id)  # [C_t, K]
+        saved_outputs = mem.pv_proto_outputs.to(device)  # [num_classes, d_pv]
+        input_protos = mem.input_prototypes.to(device)    # [num_classes, d_input]
 
-        if cur_logits is None or cur_logits.numel() == 0:
-            continue
+        # 当前 e_pv 参数下对旧类 prototype 的输出
+        cur_outputs = _compute_pv_features(prompt, input_protos)  # [num_classes, d_pv]
 
-        # 当前 pairwise 相似度（使用带温度的 softmax 概率）
-        cur_probs = F.softmax(cur_logits / temperature, dim=-1)  # [C_t, K]
-        cur_sim = cur_probs @ cur_probs.T  # [C_t, C_t]
-
-        # 旧 pairwise 相似度（已保存，也需要用同样温度重新计算以保持一致性）
-        # 注意：保存时的 S_t 也需要用相同温度计算
-        old_sim = mem.router_pairwise_sim.to(cur_logits.device)  # [C_t, C_t]
-
-        # MSE between pairwise similarity matrices
-        loss = F.mse_loss(cur_sim, old_sim)
-        total_loss += loss
+        loss = F.mse_loss(cur_outputs, saved_outputs)
+        total_loss = total_loss + loss
         count += 1
 
     if count == 0:
-        return torch.tensor(0.0, requires_grad=False)
+        return torch.tensor(0.0, device=device)
 
     return total_loss / count
 
 
-def compute_prototype_alignment_loss(
-    current_router_logits_fn,
-    old_memories: List[TaskMemory],
-) -> torch.Tensor:
-    """
-    可选的 prototype alignment loss（L2 版本）：
-    约束当前 router logits 不远离旧 router prototype 的绝对位置。
-
-    L_proto = Σ_t || K_t - K̂_t ||_F²
-
-    Args:
-        current_router_logits_fn: callable(task_id) -> router_logits [C_t, K]
-            给定 task_id，返回当前参数下该任务的 per-class router logits
-        old_memories: 旧任务 TaskMemory 列表
-
-    Returns:
-        prototype alignment loss（标量）
-    """
-    if not old_memories:
-        return torch.tensor(0.0, requires_grad=False)
-
-    total_loss = 0.0
-    count = 0
-
-    for mem in old_memories:
-        if mem.router_prototypes is None:
-            continue
-
-        cur_logits = current_router_logits_fn(mem.task_id)  # [C_t, K]
-
-        if cur_logits is None or cur_logits.numel() == 0:
-            continue
-
-        old_logits = mem.router_prototypes.to(cur_logits.device)  # [C_t, K]
-        loss = F.mse_loss(cur_logits, old_logits)
-        total_loss += loss
-        count += 1
-
-    if count == 0:
-        return torch.tensor(0.0, requires_grad=False)
-
-    return total_loss / count
-
+# ═══════════════════════════════════════════════════════════════
+# 保留的兼容函数
+# ═══════════════════════════════════════════════════════════════
 
 def save_key_prototypes(
     model, dataloader, num_classes: int, device: str = "cuda"
@@ -134,9 +90,9 @@ def save_key_prototypes(
     """
     在任务完成后保存 key prototypes 和 pairwise 相似度矩阵。
 
-    NOTE (v1 fix): 由于 ViT 冻结，key_query (cls_token) 不产生训练梯度。
-    此函数仍保存 key prototypes 供参考/评估，但训练时的 key relation loss
-    改为基于 router logits（见 compute_key_relation_loss）。
+    NOTE: v3 中 key prototypes 不再用于训练损失，仅保留用于诊断。
+    实际的特征蒸馏使用 router_kl.save_router_prototypes 保存的 input_prototypes
+    和 router_kl.save_pv_proto_outputs 保存的 pv_proto_outputs。
 
     Args:
         model: SMoPE 模型
@@ -157,18 +113,14 @@ def save_key_prototypes(
         for x, y, _ in dataloader:
             x = x.to(device)
             y = y.to(device)
-
-            # 获取 query（cls_token），这代表了该样本对 key 空间的查询
-            key_q = model.prompt.get_key_query(x, vit=model.feat)  # [B, embed_dim]
+            key_q = model.prompt.get_key_query(x, vit=model.feat)
             all_key_queries.append(key_q.cpu())
             all_labels.append(y.cpu())
 
-    all_key_queries = torch.cat(all_key_queries, dim=0)  # [N, d_key]
-    all_labels = torch.cat(all_labels, dim=0)           # [N]
+    all_key_queries = torch.cat(all_key_queries, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
 
     d_key = all_key_queries.size(-1)
-
-    # Per-class mean → key prototypes
     key_prototypes = torch.zeros(num_classes, d_key)
     for c in range(num_classes):
         mask = (all_labels == c)
@@ -177,8 +129,21 @@ def save_key_prototypes(
         else:
             key_prototypes[c] = all_key_queries.mean(dim=0)
 
-    # Pairwise 相似度矩阵
     key_norm = F.normalize(key_prototypes, dim=-1)
-    key_pairwise_sim = key_norm @ key_norm.T  # [num_classes, num_classes]
+    key_pairwise_sim = key_norm @ key_norm.T
 
     return key_prototypes, key_pairwise_sim
+
+
+# ═══════════════════════════════════════════════════════════════
+# 废弃函数（保留导入兼容）
+# ═══════════════════════════════════════════════════════════════
+
+def compute_key_relation_loss(*args, **kwargs):
+    """[DEPRECATED v3] Key Relation Distillation 已废弃，返回零张量。"""
+    return torch.tensor(0.0, requires_grad=False)
+
+
+def compute_prototype_alignment_loss(*args, **kwargs):
+    """[DEPRECATED v3] Prototype Alignment 已废弃，返回零张量。"""
+    return torch.tensor(0.0, requires_grad=False)
