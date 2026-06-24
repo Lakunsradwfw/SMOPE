@@ -169,6 +169,122 @@ SMoPE/
 
 ---
 
+### 2.6 v2 版本优化记录（2025-07-15）
+
+> **版本**：v2 — 诊断日志 + NaN 修复 + 增量 SVD + 温度软化
+> **状态**：已实现，默认启用（超参数已优化）
+
+#### 2.6.1 v1 训练数据分析
+
+在 CIFAR-100 10-task 上训练 v1（组件全开，5 repeats），与原始 SMoPE baseline 对比：
+
+| 指标 | Baseline | v1 | Δ |
+|------|----------|----|---|
+| FAA | 88.88 | 88.83 | **-0.05**（退化） |
+| CAA | 92.78 | 92.81 | +0.03 |
+| FR | 4.30 | 4.06 | -0.24（遗忘略减） |
+
+逐任务准确率从 Task 3 开始 v1 持续落后，差距随任务数增大（Task 10: 88.88→88.64）。
+
+**三个关键 Bug 定位**：
+
+| # | 现象 | 根因 | 影响 |
+|---|------|------|------|
+| 1 | Loss NaN ×900 次 | `softmax→log(0)=-inf`，`lambda_key=0.5` 过大约束 | 组件一/三损失无效 |
+| 2 | SVD r=1（d=230400） | 单任务末期梯度方向高度共线 | 组件二梯度投影 ≈ 恒等映射 |
+| 3 | Router prototype 保存失败 | `(128×3) @ (64×25)` 维度不匹配 | replay-1 task-0 的 KL/proto 数据损坏 |
+
+#### 2.6.2 新增文件
+
+```
+SMoPE/
+├── protection/
+│   └── loss_logger.py             # ← v2 新增：DiagnosticLogger 诊断日志模块
+```
+
+#### 2.6.3 修改的现有文件
+
+| 文件 | 变更内容 |
+|------|---------|
+| `protection/router_kl.py` | P0: `softmax` 后 `clamp(min=1e-8)` + `renormalize` 防 NaN；新增 per-memory NaN 检测跳过；新增 `compute_router_kl_with_fallback()` 自动退化到 L2 |
+| `protection/gradient_projection.py` | P1: 新增 `IncrementalSubspaceEstimator` 类（跨任务梯度快照缓冲区 + 中心化 SVD + `min_rank=5`）；`estimate_global_major_subspace()` 加中心化和 `min_rank` 参数 |
+| `protection/key_relation.py` | P2: `compute_key_relation_loss()` 新增 `temperature` 参数（默认 2.0），软化 pairwise 相似度矩阵 |
+| `protection/__init__.py` | 导出新增符号：`IncrementalSubspaceEstimator`, `compute_router_kl_with_fallback`, `DiagnosticLogger`, `compute_key_sim_distance` |
+| `models/zoo.py` | P0: 超参数降权；新增 `key_temperature` 和 `enable_diagnostic_log` 配置项 |
+| `learners/prompt.py` | P0+P1+P2: `update_model()` 分离各 loss 分量 + NaN 自动退化；`_on_task_finish()` 使用 IncrementalSubspaceEstimator + 记录 SVD 谱/expert 频率/key sim 距离；集成 DiagnosticLogger |
+| `pull.md` | 追加 v2 PR 条目（Bug 分析 + P0/P1/P2 修改对照表） |
+
+#### 2.6.4 组件优化细节
+
+**P0 — 紧急修复（组件一 NaN + 超参数降权）**
+
+- `compute_router_kl_loss()`: `cur_probs.log()` → `cur_probs.clamp(min=eps).log()`，重新归一化保证概率和为 1
+- 新增 `compute_router_kl_with_fallback()`：先尝试 KL，NaN 时自动切换 L2，两层都失败返回 0
+- 超参数降权：`lambda_router: 0.1→0.01`, `lambda_key: 0.5→0.05`, `lambda_proto: 0.05→0.01`
+- 理由：v1 的 λ 过大导致约束压倒 CE loss，组件三实际是唯一能工作的（但约束过度）
+
+**P1 — 增量 SVD（组件二改造）**
+
+- 新增 `IncrementalSubspaceEstimator` 类
+  - 维护跨任务梯度快照缓冲区（FIFO, buffer_size=200）
+  - SVD 前对梯度矩阵做**中心化**（减去均值），使 SVD 捕获变化方向而非均值方向
+  - `min_rank=5` 硬约束：SVD 保留的秩至少为 5，解决单任务 r=1 退化
+  - 存储到 CPU 以节省显存
+- `estimate_global_major_subspace()` 同步加中心化和 `min_rank` 参数
+- 理由：v1 每任务独立 SVD，末期梯度几乎共线 → r=1；v2 跨任务累积 + 中心化 → r≥5
+
+**P2 — 诊断日志 + 温度软化（组件三）**
+
+- 新建 `DiagnosticLogger`（`protection/loss_logger.py`）：
+  - `log_losses()`: 每 N batch 记录 L_ce / L_kl / L_key_rel / L_proto / L_total，标注 NaN 和退化方案
+  - `log_svd_spectrum()`: 记录 top-10 奇异值 + 累计方差比例 + condition number + effective rank
+  - `log_expert_freqs()`: expert 频率直方图 + top/bottom-5 + entropy
+  - `log_key_sim_distance()`: 旧任务 pairwise 相似度距离（Frobenius/Max/Mean）
+  - 日志路径：`outputs/cifar-100/10-task/one-prompt/lossoutput.log`
+- `compute_key_relation_loss()` 加 `temperature=2.0`：`softmax(logits/T)` 软化分布，降低 pairwise sim 约束的尖锐度
+- `save_router_prototypes()` 保存 `router_pairwise_sim` 时同步使用 `key_temperature`
+
+#### 2.6.5 超参数变更对照
+
+| 超参数 | v1 默认值 | v2 默认值 | 说明 |
+|--------|----------|----------|------|
+| `lambda_router` | 0.1 | **0.01** | KL 散度权重降 10× |
+| `lambda_key` | 0.5 | **0.05** | Key Relation 权重降 10× |
+| `lambda_proto` | 0.05 | **0.01** | Prototype Alignment 权重降 5× |
+| `key_temperature` | — | **2.0** | 新增：Key Relation 温度 |
+| `enable_diagnostic_log` | — | **True** | 新增：启用分项 loss 日志 |
+| `freq_threshold` | 0.1 | 0.1 | 不变 |
+| `temperature` | 1.0 | 1.0 | KL 温度不变 |
+| `use_grad_projection` | True | True | 不变 |
+| `use_alternating_update` | True | True | 不变 |
+
+#### 2.6.6 v2 训练期数据流
+
+```
+每个 batch:
+  L_ce → L_kl(NaN?→L2) → L_proto → total_loss.backward()
+  → 梯度投影(min_rank≥5) → optimizer_ce.step()
+  → L_key_rel(temperature=2.0) → optimizer_key.step()
+  → DiagnosticLogger.log_losses()
+
+每个 task 完成:
+  save_router_prototypes(temperature=2.0)
+  → IncrementalSubspaceEstimator.add_snapshots(跨任务梯度)
+  → estimate_subspace(min_rank=5) → 记录 SVD 谱
+  → 记录 expert 频率分布 + key sim 距离
+```
+
+#### 2.6.7 已知限制 & 后续改进
+
+| 限制 | 等级 | 计划 |
+|------|------|------|
+| IncrementalSubspaceEstimator 缓冲区使用 CPU 存储，大 d_total 下内存占用可观 | 中 | v3: 改用随机投影压缩梯度快照（[n, d]→[n, k] where k≪d） |
+| 超参数仍为手动设定，未做 systematic hyperparameter search | 中 | v3: 每个 λ 做 grid search 或 Bayesian optimization |
+| DiagnosticLogger 间隔固定 10 batch，大任务下日志量大 | 低 | 改为自适应间隔（early epoch 密集、later epoch 稀疏） |
+| Alternating update 每 batch 创建新 key_optimizer | 低 | 复用 optimizer 实例，zero_grad 替代重建 |
+
+---
+
 ## 3. 统一设计原则：Activation-Weighted Stability-Plasticity Trade-off
 
 > 每个参数子空间（router / expert / key）的保护强度与其在旧任务中的**激活频率**成正比。
@@ -697,6 +813,6 @@ SMOPE/
 
 ---
 
-> **最后更新**：2025-07-15（v1 实现完成）
+> **最后更新**：2025-07-15（v2 优化完成）
 > **下次对话**：读取本文件即可恢复全部上下文，无需重复描述项目背景。
-> **当前版本**：v1 — 三组件异构梯度保护框架已落地，默认关闭，通过超参数控制启用。
+> **当前版本**：v2 — 诊断日志 + NaN 修复 + 增量 SVD + 温度软化；默认启用，超参数已优化。
