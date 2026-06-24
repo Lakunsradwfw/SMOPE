@@ -615,11 +615,12 @@ class OnePrompt(Prompt):
 
         self.model.eval()
 
-        self.last_valid_out_dim = self.valid_out_dim
         self.first_task = False
 
         # ── v1: on_task_finish — 保存旧任务约束信息 ──
         self._on_task_finish(train_loader)
+
+        self.last_valid_out_dim = self.valid_out_dim
 
         # Extend memory
         self.task_count += 1

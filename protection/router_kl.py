@@ -79,9 +79,13 @@ def compute_router_kl_loss(
 
         # NaN/Inf 检测：跳过异常的 memory
         if torch.isnan(kl) or torch.isinf(kl):
-            print(f"[v1] WARNING: KL divergence is NaN/Inf for task {mem.task_id}, "
-                  f"skipping. cur_logits range: [{cur_logits.min().item():.4f}, "
-                  f"{cur_logits.max().item():.4f}]")
+            if cur_logits.numel() == 0:
+                print(f"[v1] WARNING: KL divergence is NaN/Inf for task {mem.task_id}, "
+                      f"skipping. cur_logits is empty (num_classes=0 in memory).")
+            else:
+                print(f"[v1] WARNING: KL divergence is NaN/Inf for task {mem.task_id}, "
+                      f"skipping. cur_logits range: [{cur_logits.min().item():.4f}, "
+                      f"{cur_logits.max().item():.4f}]")
             continue
 
         total_kl += kl
@@ -178,6 +182,9 @@ def save_router_prototypes(
     Returns:
         (router_prototypes [num_classes, K], input_prototypes [num_classes, d_input])
     """
+    if num_classes <= 0:
+        raise ValueError(f"num_classes must be > 0, got {num_classes}")
+
     all_router_logits = []
     all_input_repr = []
     all_labels = []
