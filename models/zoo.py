@@ -423,6 +423,21 @@ class OnePrompt(nn.Module):
         }
 
 
+    def get_v1_config(self):
+        """Return the v3-lite protection defaults."""
+        return {
+            "lambda_pk": 0.003,
+            "lambda_pv": 0.12,
+            "lambda_feat": 0.02,
+            "freq_threshold": 0.02,
+            "max_feature_memories": 4,
+            "temperature": 1.0,
+            "key_temperature": 2.0,
+            "enable_diagnostic_log": False,
+            "diagnostic_log_interval": 50,
+        }
+
+
 class VQPrompt(nn.Module):
     def __init__(self, emb_d, n_tasks, prompt_param, key_dim=768):
         super().__init__()

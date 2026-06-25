@@ -102,6 +102,80 @@ def compute_pv_l2_reg(
     return total_loss / count
 
 
+def build_pv_l2_anchor(
+    prompt,
+    old_memories: List[TaskMemory],
+    freq_threshold: float = 0.0,
+) -> tuple:
+    """
+    Build a consolidated weighted anchor for e_pv.
+
+    This is the fast form of the original per-memory L2 regularizer. It keeps
+    the same gradient with respect to current e_pv parameters, but computes a
+    single weighted target per parameter after each task.
+    """
+    if not old_memories:
+        return None, None, 0
+
+    device = next(prompt.parameters()).device
+    sums = {}
+    weight_sums = {}
+    normalizer = 0
+
+    with torch.no_grad():
+        for mem in old_memories:
+            if mem.pv_snapshot is None:
+                continue
+
+            usage_freq = mem.expert_usage_freq
+            for name, old_val in mem.pv_snapshot.items():
+                if "e_pv" not in name:
+                    continue
+                weight = _get_pv_expert_weight(name, usage_freq, freq_threshold)
+                if weight <= 0:
+                    continue
+
+                old_val = old_val.detach().to(device)
+                if name not in sums:
+                    sums[name] = torch.zeros_like(old_val)
+                    weight_sums[name] = 0.0
+                sums[name].add_(old_val, alpha=float(weight))
+                weight_sums[name] += float(weight)
+                normalizer += 1
+
+        anchors = {
+            name: total / max(weight_sums[name], 1e-12)
+            for name, total in sums.items()
+        }
+
+    return anchors, weight_sums, normalizer
+
+
+def compute_pv_l2_reg_from_anchor(
+    prompt,
+    anchors: Optional[dict],
+    weight_sums: Optional[dict],
+    normalizer: int,
+) -> torch.Tensor:
+    """Compute e_pv L2 regularization from a consolidated anchor."""
+    device = next(prompt.parameters()).device
+    if not anchors or not weight_sums or normalizer <= 0:
+        return torch.tensor(0.0, device=device)
+
+    total_loss = torch.tensor(0.0, device=device)
+    count = 0
+    for name, p in prompt.named_parameters():
+        if "e_pv" not in name or name not in anchors:
+            continue
+        anchor = anchors[name].to(device)
+        total_loss = total_loss + float(weight_sums[name]) * F.mse_loss(p, anchor)
+        count += 1
+
+    if count == 0:
+        return torch.tensor(0.0, device=device)
+    return total_loss / float(normalizer)
+
+
 def _get_pv_expert_weight(
     param_name: str,
     usage_freq: Optional[torch.Tensor],

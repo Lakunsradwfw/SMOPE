@@ -24,10 +24,14 @@ from protection.router_kl import (
     save_pk_weights,
     save_pv_proto_outputs,
     compute_pk_l2_reg,
+    build_pk_l2_anchor,
+    compute_pk_l2_reg_from_anchor,
 )
 from protection.gradient_projection import (
     save_pv_weights,
     compute_pv_l2_reg,
+    build_pv_l2_anchor,
+    compute_pv_l2_reg_from_anchor,
     save_expert_usage_freqs,
     collect_expert_gradients,
     IncrementalSubspaceEstimator,
@@ -187,6 +191,8 @@ class OnePrompt(Prompt):
         super(OnePrompt, self).__init__(learner_config)
         # ── v1: Heterogeneous Gradient Protection state ──
         self.old_memories: list = []  # List[TaskMemory]
+        self._pk_l2_anchor = None
+        self._pv_l2_anchor = None
         self._v1_config = None  # lazy init after model creation
         # ── v2: Diagnostic Logger ──
         self._diag_logger: DiagnosticLogger = None  # lazy init in _init_v1_config
@@ -209,6 +215,7 @@ class OnePrompt(Prompt):
                 "freq_threshold": 0.0,
                 "temperature": 1.0,
                 "key_temperature": 2.0,
+                "max_feature_memories": 4,
                 "enable_diagnostic_log": False,
             }
         print(f"[DEBUG] v1_config = {self._v1_config}")
@@ -217,7 +224,7 @@ class OnePrompt(Prompt):
         if self._diag_logger is None and self._v1_config.get("enable_diagnostic_log", False):
             self._diag_logger = DiagnosticLogger(
                 log_dir="outputs/cifar-100/10-task/one-prompt",
-                log_interval_batches=10,
+                log_interval_batches=self._v1_config.get("diagnostic_log_interval", 50),
             )
 
     def create_model(self):
@@ -229,6 +236,28 @@ class OnePrompt(Prompt):
             pretrained=cfg["pretrained_weight"],
         )  # vit_pt_imnet
         return model
+
+    def _refresh_l2_anchors(self, prompt):
+        """Refresh consolidated old-task anchors used by the fast v3 regularizers."""
+        if not self.old_memories:
+            self._pk_l2_anchor = None
+            self._pv_l2_anchor = None
+            return
+
+        freq_threshold = self._v1_config.get("freq_threshold", 0.0)
+        if self._v1_config.get("lambda_pk", 0.0) > 0:
+            self._pk_l2_anchor = build_pk_l2_anchor(
+                prompt, self.old_memories, freq_threshold=freq_threshold
+            )
+        else:
+            self._pk_l2_anchor = None
+
+        if self._v1_config.get("lambda_pv", 0.0) > 0:
+            self._pv_l2_anchor = build_pv_l2_anchor(
+                prompt, self.old_memories, freq_threshold=freq_threshold
+            )
+        else:
+            self._pv_l2_anchor = None
 
     def init_optimizer(self, epoch_factor=1):
 
@@ -322,9 +351,11 @@ class OnePrompt(Prompt):
         # ── v3 组件一：e_pk 权重空间 L2 正则 ──
         lambda_pk = v1.get("lambda_pk", 0.0)
         if lambda_pk > 0 and self.old_memories:
-            L_pk = compute_pk_l2_reg(
-                prompt, self.old_memories,
-                freq_threshold=v1.get("freq_threshold", 0.0),
+            if self._pk_l2_anchor is None:
+                self._refresh_l2_anchors(prompt)
+            anchors, weights, normalizer = self._pk_l2_anchor or (None, None, 0)
+            L_pk = compute_pk_l2_reg_from_anchor(
+                prompt, anchors, weights, normalizer
             )
             L_pk_val = L_pk.detach().clone()
             if not torch.isnan(L_pk) and not torch.isinf(L_pk):
@@ -333,9 +364,11 @@ class OnePrompt(Prompt):
         # ── v3 组件二：e_pv 权重空间 L2 正则 ──
         lambda_pv = v1.get("lambda_pv", 0.0)
         if lambda_pv > 0 and self.old_memories:
-            L_pv = compute_pv_l2_reg(
-                prompt, self.old_memories,
-                freq_threshold=v1.get("freq_threshold", 0.0),
+            if self._pv_l2_anchor is None:
+                self._refresh_l2_anchors(prompt)
+            anchors, weights, normalizer = self._pv_l2_anchor or (None, None, 0)
+            L_pv = compute_pv_l2_reg_from_anchor(
+                prompt, anchors, weights, normalizer
             )
             L_pv_val = L_pv.detach().clone()
             if not torch.isnan(L_pv) and not torch.isinf(L_pv):
@@ -345,7 +378,10 @@ class OnePrompt(Prompt):
         lambda_feat = v1.get("lambda_feat", 0.0)
         if lambda_feat > 0 and self.old_memories:
             L_feat = compute_feature_distill_loss(
-                prompt, self.old_memories, device=inputs.device,
+                prompt,
+                self.old_memories,
+                device=inputs.device,
+                max_memories=v1.get("max_feature_memories", 4),
             )
             L_feat_val = L_feat.detach().clone()
             if not torch.isnan(L_feat) and not torch.isinf(L_feat):
@@ -626,10 +662,10 @@ class OnePrompt(Prompt):
 
                 # v3 组件三：保存 e_pv 在各类 prototype 上的输出特征
                 if need_feat:
-                    from protection.router_kl import save_pv_proto_outputs
-                    pv_outputs = save_pv_proto_outputs(
-                        self.model, train_loader, num_classes, device
-                    )
+                    from protection.router_kl import _compute_pv_features
+                    pv_outputs = _compute_pv_features(
+                        prompt, input_protos.to(device)
+                    ).detach().cpu()
                     memory.pv_proto_outputs = pv_outputs
                     print(f"[v3] Saved e_pv proto outputs: {pv_outputs.shape}")
             except Exception as e:
@@ -651,6 +687,7 @@ class OnePrompt(Prompt):
 
         # 保存到 old_memories 列表
         self.old_memories.append(memory)
+        self._refresh_l2_anchors(prompt)
         print(f"[v3] Task {self.task_count} memory saved. "
               f"Total old memories: {len(self.old_memories)}")
 

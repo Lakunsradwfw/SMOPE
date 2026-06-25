@@ -37,6 +37,7 @@ def compute_feature_distill_loss(
     prompt,
     old_memories: List[TaskMemory],
     device: str = "cuda",
+    max_memories: Optional[int] = None,
 ) -> torch.Tensor:
     """
     对旧任务各类 prototype 输入，约束当前 e_pv 输出特征不偏离保存的特征。
@@ -60,7 +61,11 @@ def compute_feature_distill_loss(
     total_loss = torch.tensor(0.0, device=device)
     count = 0
 
-    for mem in old_memories:
+    memories = old_memories
+    if max_memories is not None and max_memories > 0:
+        memories = old_memories[-max_memories:]
+
+    for mem in memories:
         if mem.pv_proto_outputs is None or mem.input_prototypes is None:
             continue
 

@@ -104,6 +104,80 @@ def compute_pk_l2_reg(
     return total_loss / count
 
 
+def build_pk_l2_anchor(
+    prompt,
+    old_memories: List[TaskMemory],
+    freq_threshold: float = 0.0,
+) -> tuple:
+    """
+    Build a consolidated weighted anchor for e_pk.
+
+    The gradient of sum_t w_t * mse(p, old_t) is equivalent to
+    sum_t w_t * mse(p, weighted_mean(old_t)) up to a constant, so this keeps
+    the same optimization signal while avoiding a per-task loop every batch.
+    """
+    if not old_memories:
+        return None, None, 0
+
+    device = next(prompt.parameters()).device
+    sums = {}
+    weight_sums = {}
+    normalizer = 0
+
+    with torch.no_grad():
+        for mem in old_memories:
+            if mem.pk_snapshot is None:
+                continue
+
+            usage_freq = mem.expert_usage_freq
+            for name, old_val in mem.pk_snapshot.items():
+                if "e_pk" not in name:
+                    continue
+                weight = _get_pk_expert_weight(name, usage_freq, freq_threshold)
+                if weight <= 0:
+                    continue
+
+                old_val = old_val.detach().to(device)
+                if name not in sums:
+                    sums[name] = torch.zeros_like(old_val)
+                    weight_sums[name] = 0.0
+                sums[name].add_(old_val, alpha=float(weight))
+                weight_sums[name] += float(weight)
+                normalizer += 1
+
+        anchors = {
+            name: total / max(weight_sums[name], 1e-12)
+            for name, total in sums.items()
+        }
+
+    return anchors, weight_sums, normalizer
+
+
+def compute_pk_l2_reg_from_anchor(
+    prompt,
+    anchors: Optional[dict],
+    weight_sums: Optional[dict],
+    normalizer: int,
+) -> torch.Tensor:
+    """Compute e_pk L2 regularization from a consolidated anchor."""
+    device = next(prompt.parameters()).device
+    if not anchors or not weight_sums or normalizer <= 0:
+        return torch.tensor(0.0, device=device)
+
+    total_loss = torch.tensor(0.0, device=device)
+    count = 0
+    for name, p in prompt.named_parameters():
+        if "e_pk" not in name or name not in anchors:
+            continue
+        anchor = anchors[name].to(device)
+        total_loss = total_loss + float(weight_sums[name]) * F.mse_loss(p, anchor)
+        count += 1
+
+    if count == 0:
+        return torch.tensor(0.0, device=device)
+    return total_loss / float(normalizer)
+
+
 def _get_pk_expert_weight(
     param_name: str,
     usage_freq: Optional[torch.Tensor],
@@ -226,6 +300,36 @@ def _compute_pv_features(prompt, x_query: torch.Tensor) -> torch.Tensor:
 # ═══════════════════════════════════════════════════════════════
 # 保留的兼容函数
 # ═══════════════════════════════════════════════════════════════
+
+def _compute_pv_features(prompt, x_query: torch.Tensor) -> torch.Tensor:
+    """
+    Fast e_pv feature path.
+
+    This intentionally overrides the legacy loop above. It batches all experts
+    within a head and keeps the legacy feature order: layer, expert, head.
+    """
+    B = x_query.shape[0]
+    num_heads = prompt.num_heads
+    head_dim = prompt.head_dim
+    x_heads = x_query.view(B, num_heads, head_dim)
+
+    layer_feats = []
+    for e in prompt.e_layers:
+        head_scores = []
+        for h in range(num_heads):
+            pv_h = torch.cat(
+                [getattr(prompt, f"e_pv_{e}_{l}_{h}") for l in range(prompt.num_experts)],
+                dim=0,
+            )
+            head_scores.append(x_heads[:, h, :] @ pv_h.T)
+        layer_feats.append(
+            torch.stack(head_scores, dim=2).reshape(
+                B, prompt.num_experts * num_heads
+            )
+        )
+
+    return torch.cat(layer_feats, dim=-1)
+
 
 def save_router_prototypes(
     model, dataloader, num_classes: int, device: str = "cuda"
