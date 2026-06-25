@@ -409,6 +409,337 @@ SMoPE/
 
 ---
 
+### 2.8 v3-lite 版本优化记录（2026-06-25）
+
+> **版本**：v3-lite — 保留三组件思路，改为轻量锚点正则 + 近邻特征蒸馏 + 独立有效数据日志
+> **状态**：已实现，默认启用；目标是在不显著拖慢速度的前提下争取约 1%-2% 的性能提升。
+> **选择依据**：v1 存在 NaN 与 SVD r=1 退化；v2 在 FAA 上基本无增益；v3 的方向更接近遗忘根因（e_pv 漂移），但逐旧任务逐参数计算和全量特征蒸馏导致速度过慢。
+
+#### 2.8.1 数据分析结论
+
+基于 `output.log` 第 8652 行以后、`v3_output.log`、`v3_lossoutput.log` 的对比：
+
+| 版本 | 主要现象 | 结论 |
+|------|---------|------|
+| v1 | 训练中出现 NaN，SVD 子空间经常退化到 r=1 | 不适合作为继续优化基线 |
+| v2 | FAA 与 baseline 基本持平，保护 loss 大量接近 0 | 稳定性修复有效，但保护信号太弱 |
+| v3 | e_pk/e_pv/feature loss 有非零信号，但验证与训练耗时明显升高 | 保留方向，压缩实现成本 |
+
+关键判断：router/key 侧本身较稳定，继续强约束 e_pk 收益有限；遗忘更可能来自 e_pv value 侧漂移。因此 v3-lite 降低 e_pk 约束，增强 e_pv 约束，并把 feature distill 作为低成本辅助项。
+
+#### 2.8.2 修改的现有文件
+
+| 文件 | 变更内容 |
+|------|---------|
+| `protection/router_kl.py` | 新增 `build_pk_l2_anchor()`、`compute_pk_l2_reg_from_anchor()`；新增快速版 `_compute_pv_features()`，按 head 批量计算所有 expert，替代大量小矩阵乘法 |
+| `protection/gradient_projection.py` | 新增 `build_pv_l2_anchor()`、`compute_pv_l2_reg_from_anchor()`，将 e_pv 逐旧任务 L2 改为加权锚点 L2 |
+| `protection/key_relation.py` | `compute_feature_distill_loss()` 新增 `max_memories`，默认只对最近若干旧任务做功能空间蒸馏 |
+| `protection/__init__.py` | 导出新增 anchor 构建与 anchor 正则函数 |
+| `learners/prompt.py` | 新增 `_refresh_l2_anchors()`；训练时使用 anchor 正则；task 结束后刷新 anchor；组件三直接用 `input_protos` 生成 `pv_proto_outputs`，避免重复遍历 dataloader 和 prototype 不一致 |
+| `models/zoo.py` | 新增 v3-lite 默认超参数：`lambda_pk=0.003`, `lambda_pv=0.12`, `lambda_feat=0.02`, `freq_threshold=0.02`, `max_feature_memories=4`，默认关闭高频诊断日志 |
+| `run.py` | 主输出改为 `v3_lite_output.log`；新增 `EffectiveDataLogger`，输出独立有效数据日志 `v3_lite_effective.log` |
+| `experiments/cifar-100_v3_lite.sh` | 新增 CIFAR-100 v3-lite 启动脚本 |
+
+#### 2.8.3 三组件实现逻辑
+
+**组件一：e_pk 弱锚点正则**
+
+原 v3 每个 batch 对所有旧任务的 `pk_snapshot` 逐参数计算：
+
+```text
+sum_t w_t * MSE(p_cur, p_old_t)
+```
+
+v3-lite 利用等价梯度形式，把多个旧任务快照合并为一个加权 anchor：
+
+```text
+anchor = sum_t w_t * p_old_t / sum_t w_t
+loss   = sum_t w_t * MSE(p_cur, anchor)
+```
+
+该形式与原式对当前参数 `p_cur` 的梯度一致，只去掉常数项，训练时不再随旧任务数量线性增长。由于日志显示 router/key 较稳定，默认 `lambda_pk` 降为 `0.003`。
+
+**组件二：e_pv 主保护锚点正则**
+
+e_pv 是 v3-lite 的主保护对象。实现与 e_pk 相同，但默认权重提高到 `lambda_pv=0.12`。同时 `freq_threshold=0.02`，低频 expert 不进入锚点约束，保留新任务塑性。
+
+**组件三：近邻功能空间蒸馏**
+
+v3 原实现对所有旧任务 prototype 反复计算 `_compute_pv_features()`，且保存 `pv_proto_outputs` 时使用的 query 与训练时的 `input_prototypes` 存在不一致。v3-lite 做两点修正：
+
+- task 结束时直接用同一组 `input_protos` 生成 `pv_proto_outputs`
+- 训练时只对最近 `max_feature_memories=4` 个旧任务做 feature distill
+
+这样组件三仍保护 e_pv 在旧类 prototype 上的函数行为，但成本不会随 10-task 全量历史快速膨胀。
+
+#### 2.8.4 超参数变更对照
+
+| 超参数 | v3 默认值 | v3-lite 默认值 | 说明 |
+|--------|----------|---------------|------|
+| `lambda_pk` | 0.01 | **0.003** | e_pk 已较稳定，弱约束即可 |
+| `lambda_pv` | 0.05 | **0.12** | e_pv 漂移是主保护目标 |
+| `lambda_feat` | 0.01 | **0.02** | 增强功能空间辅助约束 |
+| `freq_threshold` | 0.0 | **0.02** | 低频 expert 不约束，保留塑性 |
+| `max_feature_memories` | 无 | **4** | 特征蒸馏只使用最近旧任务 |
+| `enable_diagnostic_log` | True | **False** | 默认关闭高频 batch 诊断，避免 I/O 拖慢 |
+| `diagnostic_log_interval` | 10 | **50** | 若开启诊断，默认更稀疏 |
+
+#### 2.8.5 v3-lite 训练期数据流
+
+```text
+每个 task 结束:
+  save_pk_weights / save_pv_weights
+  save_router_prototypes -> input_prototypes
+  _compute_pv_features(input_prototypes) -> pv_proto_outputs
+  save_expert_usage_freqs
+  build_pk_l2_anchor + build_pv_l2_anchor
+
+每个 batch:
+  L_ce
+  + lambda_pk * L_pk(anchor)
+  + lambda_pv * L_pv(anchor)
+  + lambda_feat * L_feat(recent old prototypes)
+  -> single backward -> optimizer.step()
+```
+
+#### 2.8.6 输出与有效数据日志
+
+主训练输出文件改为：
+
+```text
+outputs/cifar-100/10-task/one-prompt/v3_lite_output.log
+```
+
+整体精度数据项保持不变，仍输出并保存：
+
+```text
+acc, time, fr, FAA, CAA, FR
+```
+
+另新增单独有效数据日志：
+
+```text
+outputs/cifar-100/10-task/one-prompt/v3_lite_effective.log
+```
+
+该日志为 JSON lines，每个 repeat 记录：
+
+- `faa_by_task`
+- `fr_by_task`
+- `time_per_epoch_by_task`
+- `final_per_task_acc`
+- `forgetting_by_task`
+- `worst_final_task_id`
+- `max_forgetting_task_id`
+- `late_task_plasticity`
+- `running_summary`
+
+用途：下次优化时无需重新解析完整 stdout，可直接定位是“旧任务遗忘”“新任务塑性不足”还是“速度瓶颈”。
+
+#### 2.8.7 启动方式
+
+```bash
+bash experiments/cifar-100_v3_lite.sh
+```
+
+验证记录：
+
+```text
+python -m py_compile run.py learners/prompt.py protection/router_kl.py protection/gradient_projection.py protection/key_relation.py protection/__init__.py models/zoo.py
+python test_device_fix.py  # 在 UTF-8 输出环境下通过；普通 GBK 控制台可能因 ✓ 字符打印失败
+```
+
+---
+
+### 2.9 v4-light / v4-split-lite 版本优化记录（2026-06-26）
+
+> **版本**：v4-split-lite — 轻量 router 稳态 + expert anchor + SplitLoRA-style 在线低秩软投影  
+> **状态**：已实现并推送到 `v4` 分支。  
+> **核心判断**：v4-light 可以作为工程止血版本，但如果项目创新点仍要落在“把 SplitLoRA 思想迁移到 SMoPE”，则必须保留梯度空间切分/投影这一机制。v4-split-lite 因此补回轻量化的 major-subspace soft projection，同时避免 v1/v2 的重型全量 SVD。
+
+#### 2.9.1 方向修正结论
+
+v1/v2/v3/v3-lite 的实验说明：
+
+| 版本 | 主要问题 | 处理策略 |
+|------|---------|---------|
+| v1 | NaN、SVD 退化到 r=1、保护信号不稳定 | 不再沿用重型 per-task SVD 实现 |
+| v2 | 修复稳定性后 FAA 仍基本无增益，KL/key loss 大量接近 0 | 不把 router/key KL 作为主创新机制 |
+| v3 | e_pk/e_pv/feature loss 有信号，但速度显著下降 | 保留 e_pv 是遗忘主因的判断，压缩成本 |
+| v3-lite | 完整 10 task FAA 约 88.99，提升有限且仍慢 | 作为对照，不作为最终 SplitLoRA 叙事版本 |
+| v4-light | 速度友好，但与 SplitLoRA 的梯度空间切分关系偏弱 | 升级为 v4-split-lite |
+
+最终选择：保留三组件设计，但把组件二重新拉回 SplitLoRA 语义，即“旧任务 major direction 软削弱，新任务保留 minor-space 可塑性”。
+
+#### 2.9.2 三组件实现逻辑
+
+**组件一：Router / Gating 轻量稳态**
+
+- 复用 SMoPE 已有 `prompt_scores`，不额外前向。
+- 新增 router usage balance，避免专家选择坍缩到少数 expert。
+- 新增 old usage prior，任务切换后轻微约束当前 routing 不偏离旧任务高频使用结构。
+- 对应文件：`models/zoo.py`。
+
+**组件二：Expert Value 的 SplitLoRA-style 在线低秩软投影**
+
+- 新增 `protection/split_lite.py`。
+- 默认只作用于 `e_pv`，因为日志和 v3 诊断表明 e_pv 漂移更可能是遗忘主因。
+- 每隔 `split_lite_interval=20` 个 batch 采样一次当前 expert 梯度。
+- 每个任务结束时，对高频 expert 的梯度样本做小 rank SVD，维护旧任务 major basis。
+- 新任务训练时执行软投影：
+
+```text
+g_new <- g_new - alpha * P_major(g_new)
+```
+
+其中默认 `rank=4`，`alpha=0.2`，只削弱 major 方向而不是硬删除，避免新任务塑性被破坏。
+
+**组件三：Key / Prototype 保留为轻量诊断与可选约束**
+
+- 默认 `lambda_feat=0.0`，不再每 batch 做旧 prototype feature distillation。
+- 保留 TaskMemory、anchor 与 feature distill 接口，方便后续消融或针对性开启。
+- 当前主创新不再依赖昂贵的 feature distill，而是依赖组件二的低秩梯度空间保护。
+
+#### 2.9.3 修改的文件
+
+| 文件 | 变更内容 |
+|------|---------|
+| `protection/split_lite.py` | 新增 `SplitLiteProjector`，实现 per-expert gradient buffer、低秩 basis 构建、soft projection、投影诊断日志 |
+| `protection/__init__.py` | 导出 `SplitLiteProjector` |
+| `models/zoo.py` | 默认配置升级为 v4-split-lite：`use_split_lite=True`, `split_lite_rank=4`, `split_lite_alpha=0.2`, `split_lite_interval=20`, only `e_pv` |
+| `learners/prompt.py` | 在 `total_loss.backward()` 后、`optimizer.step()` 前调用 split-lite 投影；任务结束时按 expert usage 更新 basis |
+| `run.py` | 主输出改为 `v4_split_lite_output.log`；有效数据日志改为 `v4_split_lite_effective.log`；新增 `--max_task` 命令行覆盖项 |
+| `experiments/cifar-100_v4_split_lite.sh` | 新增 CIFAR-100 v4-split-lite 启动脚本 |
+
+#### 2.9.4 默认超参数
+
+| 超参数 | 默认值 | 说明 |
+|--------|--------|------|
+| `lambda_pk` | 0.0005 | e_pk 弱 anchor，避免过度约束 router key |
+| `lambda_pv` | 0.015 | e_pv 弱 anchor，作为 soft projection 的辅助保护 |
+| `lambda_feat` | 0.0 | 默认关闭昂贵 feature distill |
+| `route_balance_weight` | 2e-4 | 防止 expert usage 坍缩 |
+| `route_prior_weight` | 1e-4 | 轻微贴近旧任务 expert usage prior |
+| `use_split_lite` | True | 启用在线低秩软投影 |
+| `split_lite_components` | `("e_pv",)` | 默认只保护 e_pv |
+| `split_lite_rank` | 4 | 每个 expert 的 major basis rank |
+| `split_lite_alpha` | 0.2 | major 方向削弱强度 |
+| `split_lite_interval` | 20 | 每 20 batch 投影/采样一次 |
+| `split_lite_buffer_size` | 24 | 每个 expert 保存的梯度样本数 |
+| `split_lite_expert_threshold` | 0.03 | 只为高频 expert 建 basis |
+| `split_lite_basis_decay` | 0.7 | 合并旧 basis 与新梯度样本时旧 basis 的保留强度 |
+
+#### 2.9.5 输出与有效数据日志
+
+主精度输出：
+
+```text
+outputs/cifar-100/10-task/one-prompt/v4_split_lite_output.log
+```
+
+有效数据日志：
+
+```text
+outputs/cifar-100/10-task/one-prompt/v4_split_lite_effective.log
+```
+
+投影诊断日志：
+
+```text
+outputs/cifar-100/10-task/one-prompt/v4_split_lite_projection.log
+```
+
+其中 `v4_split_lite_effective.log` 继续保留整体精度数据项，并额外记录：
+
+- `version = v4_split_lite`
+- `early_mean_faa`
+- `late_mean_faa`
+- `late_task_plasticity`
+- `aux_logs.projection`
+
+`v4_split_lite_projection.log` 记录每个任务结束后的 basis 规模、active experts、projected vectors、collected vectors，用于判断投影是否真的发生。
+
+#### 2.9.6 运行时间预估
+
+用户指定配置：
+
+```text
+REPEAT=1
+MAX_TASK=10
+CRCT_EPOCHS=50
+rank=4
+alpha=0.2
+interval=20
+components=e_pv
+```
+
+参考 `v3_lite_effective.log`：CIFAR-100 10-task、repeat=1、CRCT_EPOCHS=50 的总时长约 `5:51:16`。v4-split-lite 默认只对 `e_pv` 做 rank-4、每 20 batch 一次的软投影，预计额外开销约 3%-8%。
+
+因此预估总时长：
+
+```text
+约 6.0 到 6.4 小时
+保守上界：约 7 小时
+```
+
+如果 `torch` 首次加载、磁盘 IO、GPU 占用或 CUDA/cuDNN 状态不同，实际时长会有波动。
+
+#### 2.9.7 调参指南：先少跑，再放大
+
+**阶段 A：快速筛参**
+
+```bash
+REPEAT=1
+MAX_TASK=5
+CRCT_EPOCHS=10 或 20
+```
+
+目的：确认代码稳定、projection log 中有 basis 和 projected vectors、前 5 task FAA 不明显下降。
+
+优先观察：
+
+- `v4_split_lite_projection.log` 中 `basis_sizes` 是否非空
+- `projected_vectors` 是否大于 0
+- `early_mean_faa` 是否接近 v4-light / v3-lite
+
+**阶段 B：半量确认**
+
+```bash
+REPEAT=3
+MAX_TASK=10
+CRCT_EPOCHS=20 或 30
+```
+
+目的：判断趋势是否稳定，重点看 `late_mean_faa`、最终 FAA、FR。
+
+**阶段 C：正式实验**
+
+```bash
+REPEAT=5
+MAX_TASK=-1
+CRCT_EPOCHS=50
+```
+
+目的：形成可写入论文/报告的完整对比结果。
+
+**推荐 sweep 顺序**
+
+1. 固定 `rank=4`, `interval=20`，扫 `alpha = 0.1, 0.2, 0.3`
+2. 若遗忘仍高，尝试 `rank=8`
+3. 若速度慢，先把 `interval=20` 改为 `40`
+4. 若新任务塑性下降，降低 `alpha` 或提高 `split_lite_expert_threshold`
+5. 暂不建议默认开启 `e_pk` 投影；只有当 router drift 诊断显示明显问题时再加
+
+#### 2.9.8 验证记录
+
+```text
+python -m py_compile run.py learners/prompt.py models/zoo.py protection/split_lite.py protection/__init__.py
+```
+
+额外 dummy prompt 测试通过：`SplitLiteProjector` 可构建 basis，并在下一任务执行 projected vectors。
+
+---
+
 ## 3. 统一设计原则：Activation-Weighted Stability-Plasticity Trade-off
 
 > v3 更新：每个参数子空间的保护强度与其在旧任务中的**激活频率**成正比。
@@ -937,7 +1268,7 @@ SMOPE/
 
 ---
 
-> **最后更新**：2025-07-15（v3 优化完成）
+> **最后更新**：2026-06-26（v4-split-lite 在线低秩软投影与有效数据日志完成）
 > **下次对话**：读取本文件即可恢复全部上下文，无需重复描述项目背景。
-> **当前版本**：v3 — 直接权重空间 L2 正则 + 特征蒸馏；三组件全部重写；默认启用。
-> **分支**：`v3`
+> **当前版本**：v4-split-lite — 轻量 router 稳态 + e_pv anchor + SplitLoRA-style 在线低秩软投影；默认启用。
+> **分支**：`v4`
