@@ -174,15 +174,15 @@ class Logger(object):
 
 
 class EffectiveDataLogger(object):
-    """Write compact v3-lite signals for the next optimization pass."""
+    """Write compact v4-light signals for the next optimization pass."""
 
-    def __init__(self, log_dir, filename="v3_lite_effective.log"):
+    def __init__(self, log_dir, filename="v4_light_effective.log"):
         self.path = os.path.join(log_dir, filename)
         os.makedirs(log_dir, exist_ok=True)
         if not os.path.exists(self.path) or os.path.getsize(self.path) == 0:
             with open(self.path, "w", encoding="utf-8") as f:
-                f.write("# SMoPE v3-lite effective data log\n")
-                f.write("# Main accuracy output is kept in v3_lite_output.log.\n")
+                f.write("# SMoPE v4-light effective data log\n")
+                f.write("# Main accuracy output is kept in v4_light_output.log.\n")
                 f.write("# Each JSON line is self-contained for later analysis.\n")
 
     @staticmethod
@@ -202,6 +202,7 @@ class EffectiveDataLogger(object):
 
         record = {
             "event": "repeat_summary",
+            "version": "v4_light",
             "repeat_id": int(repeat_id + 1),
             "seed": int(seed),
             "total_time_sec": float(total_time_sec),
@@ -236,6 +237,7 @@ class EffectiveDataLogger(object):
         time_metric = avg_metrics["time"]["global"][:, :repeats_done]
         record = {
             "event": "running_summary",
+            "version": "v4_light",
             "repeats_done": int(repeats_done),
             "FAA_mean": float(acc[-1].mean()),
             "FAA_std": float(acc[-1].std()),
@@ -260,7 +262,7 @@ if __name__ == "__main__":
     # duplicate output stream to output file
     if not os.path.exists(args.log_dir):
         os.makedirs(args.log_dir)
-    log_out = args.log_dir + "/v3_lite_output.log"
+    log_out = args.log_dir + "/v4_light_output.log"
     sys.stdout = Logger(log_out)
     effective_logger = EffectiveDataLogger(args.log_dir)
 

@@ -7,6 +7,7 @@ from torch.autograd import Variable
 from .vit import VisionTransformer
 import numpy as np
 import copy
+import math
 
 
 # Our method
@@ -48,6 +49,13 @@ class OnePrompt(nn.Module):
             for _ in self.e_layers
         ]
         self.router_criterion = nn.CrossEntropyLoss()
+        self.route_balance_weight = 2e-4
+        self.route_prior_weight = 1e-4
+        self.route_prior_momentum = 0.7
+        self.register_buffer(
+            "expert_usage_prior",
+            torch.ones(self.num_experts, dtype=torch.float32) / self.num_experts,
+        )
 
     def process_task_count(self):
         self.task_count += 1
@@ -68,6 +76,7 @@ class OnePrompt(nn.Module):
                     freq = getattr(self, f"e_freq_{e}_{l}_{h}")
                     if freq >= freq_head_mean:
                         self.used_frequently[e][h][l] = True
+        self._update_expert_usage_prior()
 
     def router_loss(self, prompt_scores, task_id=-1, topk=-1):
         loss = 0.0
@@ -107,6 +116,21 @@ class OnePrompt(nn.Module):
 
             loss += max_loss
 
+        route_balance = self._router_usage_balance_loss(prompt_scores)
+        if route_balance is not None:
+            if self.route_balance_weight > 0:
+                loss += self.route_balance_weight * route_balance
+            if task_id is not None and task_id > 0 and self.route_prior_weight > 0:
+                current_usage = self._current_router_usage(prompt_scores)
+                if current_usage is not None:
+                    prior = self.expert_usage_prior.to(current_usage.device)
+                    prior = prior / prior.sum().clamp_min(1e-12)
+                    current_usage = current_usage.clamp_min(1e-8)
+                    prior_loss = F.kl_div(
+                        current_usage.log(), prior, reduction="batchmean"
+                    )
+                    loss += self.route_prior_weight * prior_loss
+
         if task_id > 0 and self.mu_router_old > 0:
             for e in self.e_layers:
                 for h in range(self.num_heads):
@@ -143,6 +167,48 @@ class OnePrompt(nn.Module):
                         )
 
         return loss
+
+    def _current_router_usage(self, prompt_scores):
+        usages = []
+        for e in self.e_layers:
+            if e >= len(prompt_scores) or prompt_scores[e] is None:
+                continue
+            prompt_score, prompt_score_label = prompt_scores[e]
+            score = prompt_score_label if prompt_score_label is not None else prompt_score
+            if score is None:
+                continue
+            probs = F.softmax(score.squeeze(2), dim=-1)
+            usages.append(probs.mean(dim=(0, 1)))
+        if not usages:
+            return None
+        usage = torch.stack(usages, dim=0).mean(dim=0)
+        return usage / usage.sum().clamp_min(1e-12)
+
+    def _router_usage_balance_loss(self, prompt_scores):
+        usage = self._current_router_usage(prompt_scores)
+        if usage is None:
+            return None
+        usage = usage.clamp_min(1e-8)
+        return (usage * (usage.log() + math.log(self.num_experts))).sum()
+
+    def get_expert_usage_freq(self):
+        counts = torch.zeros(self.num_experts, dtype=torch.float32)
+        for e in self.e_layers:
+            for h in range(self.num_heads):
+                for l in range(self.num_experts):
+                    counts[l] += float(getattr(self, f"e_freq_{e}_{l}_{h}"))
+        total = counts.sum()
+        if total <= 0:
+            return torch.ones(self.num_experts, dtype=torch.float32) / self.num_experts
+        return counts / total
+
+    def _update_expert_usage_prior(self):
+        current = self.get_expert_usage_freq().to(self.expert_usage_prior.device)
+        current = current / current.sum().clamp_min(1e-12)
+        momentum = float(self.route_prior_momentum)
+        momentum = min(max(momentum, 0.0), 1.0)
+        self.expert_usage_prior.mul_(momentum).add_(current, alpha=1.0 - momentum)
+        self.expert_usage_prior.div_(self.expert_usage_prior.sum().clamp_min(1e-12))
 
     def forward(self, x_querry, l, x_block, train=False, task_id=None, noise=False):
         e_valid = False
@@ -410,7 +476,7 @@ class OnePrompt(nn.Module):
                         pass
         return list(groups.values())
 
-    def get_v1_config(self):
+    def get_v3_config_deprecated(self):
         """返回 v3 保护机制所需的超参数默认值"""
         return {
             "lambda_pk": 0.01,      # v3: e_pk 权重空间 L2 正则权重
@@ -424,13 +490,16 @@ class OnePrompt(nn.Module):
 
 
     def get_v1_config(self):
-        """Return the v3-lite protection defaults."""
+        """Return v4-light protection defaults."""
         return {
-            "lambda_pk": 0.003,
-            "lambda_pv": 0.12,
-            "lambda_feat": 0.02,
-            "freq_threshold": 0.02,
-            "max_feature_memories": 4,
+            "lambda_pk": 0.001,
+            "lambda_pv": 0.03,
+            "lambda_feat": 0.0,
+            "freq_threshold": 0.01,
+            "max_feature_memories": 0,
+            "route_balance_weight": 2e-4,
+            "route_prior_weight": 1e-4,
+            "route_prior_momentum": 0.7,
             "temperature": 1.0,
             "key_temperature": 2.0,
             "enable_diagnostic_log": False,

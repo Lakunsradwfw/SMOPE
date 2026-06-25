@@ -219,6 +219,13 @@ class OnePrompt(Prompt):
                 "enable_diagnostic_log": False,
             }
         print(f"[DEBUG] v1_config = {self._v1_config}")
+        for cfg_key, attr in (
+            ("route_balance_weight", "route_balance_weight"),
+            ("route_prior_weight", "route_prior_weight"),
+            ("route_prior_momentum", "route_prior_momentum"),
+        ):
+            if cfg_key in self._v1_config and hasattr(prompt, attr):
+                setattr(prompt, attr, self._v1_config[cfg_key])
 
         # ── v2: Lazy init DiagnosticLogger ──
         if self._diag_logger is None and self._v1_config.get("enable_diagnostic_log", False):
@@ -652,7 +659,7 @@ class OnePrompt(Prompt):
         need_feat = v1.get("lambda_feat", 0.0) > 0
         need_freq = v1.get("lambda_pk", 0.0) > 0 or v1.get("lambda_pv", 0.0) > 0
 
-        if need_feat or need_freq:
+        if need_feat:
             try:
                 router_protos, input_protos = save_router_prototypes(
                     self.model, train_loader, num_classes, device
@@ -674,7 +681,10 @@ class OnePrompt(Prompt):
         # ── Expert 使用频率（组件一、二的加权依据）──
         if need_freq:
             try:
-                usage_freq = save_expert_usage_freqs(self.model, train_loader, device)
+                if hasattr(prompt, "get_expert_usage_freq"):
+                    usage_freq = prompt.get_expert_usage_freq().detach().cpu()
+                else:
+                    usage_freq = save_expert_usage_freqs(self.model, train_loader, device)
                 memory.expert_usage_freq = usage_freq
 
                 if self._diag_logger is not None:
