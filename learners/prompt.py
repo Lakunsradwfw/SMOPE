@@ -46,6 +46,7 @@ from protection.loss_logger import (
     compute_weight_drift,
     compute_feature_drift_for_memory,
 )
+from protection.split_lite import SplitLiteProjector
 
 
 class Prompt(NormalNN):
@@ -198,6 +199,7 @@ class OnePrompt(Prompt):
         self._diag_logger: DiagnosticLogger = None  # lazy init in _init_v1_config
         self._batch_count = 0  # global batch counter for logging
         self._task_epoch_count = 0  # epoch counter within current task
+        self._split_lite_projector = None
         # ── v3: no incremental subspace estimator needed ──
 
     def _init_v1_config(self):
@@ -226,6 +228,15 @@ class OnePrompt(Prompt):
         ):
             if cfg_key in self._v1_config and hasattr(prompt, attr):
                 setattr(prompt, attr, self._v1_config[cfg_key])
+        if self._split_lite_projector is None and self._v1_config.get("use_split_lite", False):
+            split_log = os.path.join(
+                self.config.get("log_dir", "."),
+                "v4_split_lite_projection.log",
+            )
+            self._split_lite_projector = SplitLiteProjector.from_config(
+                self._v1_config,
+                log_path=split_log,
+            )
 
         # ── v2: Lazy init DiagnosticLogger ──
         if self._diag_logger is None and self._v1_config.get("enable_diagnostic_log", False):
@@ -397,6 +408,12 @@ class OnePrompt(Prompt):
         # Single backward pass (no alternating update)
         self.optimizer.zero_grad()
         total_loss.backward()
+        if self._split_lite_projector is not None:
+            self._split_lite_projector.step(
+                prompt,
+                task_id=self.task_count,
+                batch_idx=self._batch_count,
+            )
         self.optimizer.step()
 
         # ── v3: 诊断日志记录 ──
@@ -623,6 +640,7 @@ class OnePrompt(Prompt):
             v1.get("lambda_pk", 0.0) > 0
             or v1.get("lambda_pv", 0.0) > 0
             or v1.get("lambda_feat", 0.0) > 0
+            or v1.get("use_split_lite", False)
         )
         if not any_v3_enabled:
             return
@@ -657,7 +675,11 @@ class OnePrompt(Prompt):
 
         # ── v3 组件三：保存 input prototypes 和 e_pv proto outputs ──
         need_feat = v1.get("lambda_feat", 0.0) > 0
-        need_freq = v1.get("lambda_pk", 0.0) > 0 or v1.get("lambda_pv", 0.0) > 0
+        need_freq = (
+            v1.get("lambda_pk", 0.0) > 0
+            or v1.get("lambda_pv", 0.0) > 0
+            or v1.get("use_split_lite", False)
+        )
 
         if need_feat:
             try:
@@ -679,6 +701,7 @@ class OnePrompt(Prompt):
                 print(f"[v3] Warning: Failed to save prototypes: {e}")
 
         # ── Expert 使用频率（组件一、二的加权依据）──
+        usage_freq = None
         if need_freq:
             try:
                 if hasattr(prompt, "get_expert_usage_freq"):
@@ -696,6 +719,19 @@ class OnePrompt(Prompt):
                 print(f"[v3] Warning: Failed to save expert usage freqs: {e}")
 
         # 保存到 old_memories 列表
+        if self._split_lite_projector is not None:
+            try:
+                split_summary = self._split_lite_projector.finalize_task(
+                    task_id=self.task_count,
+                    usage_freq=usage_freq,
+                )
+                print(
+                    "[v4-split-lite] Task "
+                    f"{self.task_count} basis updated: {split_summary['basis_sizes']}"
+                )
+            except Exception as e:
+                print(f"[v4-split-lite] Warning: Failed to update basis: {e}")
+
         self.old_memories.append(memory)
         self._refresh_l2_anchors(prompt)
         print(f"[v3] Task {self.task_count} memory saved. "

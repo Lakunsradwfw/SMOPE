@@ -95,6 +95,12 @@ def create_args():
         default=[1, 1, 1],
         help="e prompt pool size, e prompt length, g prompt length",
     )
+    parser.add_argument(
+        "--max_task",
+        type=int,
+        default=-1,
+        help="maximum number of tasks to run; -1 uses all tasks from config",
+    )
 
     # new add Args
     parser.add_argument(
@@ -174,15 +180,15 @@ class Logger(object):
 
 
 class EffectiveDataLogger(object):
-    """Write compact v4-light signals for the next optimization pass."""
+    """Write compact v4-split-lite signals for the next optimization pass."""
 
-    def __init__(self, log_dir, filename="v4_light_effective.log"):
+    def __init__(self, log_dir, filename="v4_split_lite_effective.log"):
         self.path = os.path.join(log_dir, filename)
         os.makedirs(log_dir, exist_ok=True)
         if not os.path.exists(self.path) or os.path.getsize(self.path) == 0:
             with open(self.path, "w", encoding="utf-8") as f:
-                f.write("# SMoPE v4-light effective data log\n")
-                f.write("# Main accuracy output is kept in v4_light_output.log.\n")
+                f.write("# SMoPE v4-split-lite effective data log\n")
+                f.write("# Main accuracy output is kept in v4_split_lite_output.log.\n")
                 f.write("# Each JSON line is self-contained for later analysis.\n")
 
     @staticmethod
@@ -202,9 +208,12 @@ class EffectiveDataLogger(object):
 
         record = {
             "event": "repeat_summary",
-            "version": "v4_light",
+            "version": "v4_split_lite",
             "repeat_id": int(repeat_id + 1),
             "seed": int(seed),
+            "aux_logs": {
+                "projection": "v4_split_lite_projection.log",
+            },
             "total_time_sec": float(total_time_sec),
             "total_time_hms": str(datetime.timedelta(seconds=int(total_time_sec))),
             "faa_by_task": self._tolist(acc_global),
@@ -223,6 +232,8 @@ class EffectiveDataLogger(object):
                 "worst_final_task_acc": float(np.min(final_per_task_acc)),
                 "max_forgetting_task_id": int(np.argmax(forgetting_by_task) + 1),
                 "max_forgetting": float(np.max(forgetting_by_task)),
+                "early_mean_faa": float(np.mean(acc_global[: max(1, len(acc_global) // 2)])),
+                "late_mean_faa": float(np.mean(acc_global[max(0, len(acc_global) // 2) :])),
                 "late_task_plasticity": float(acc_global[-1] - acc_global[-2])
                 if len(acc_global) > 1
                 else 0.0,
@@ -237,7 +248,7 @@ class EffectiveDataLogger(object):
         time_metric = avg_metrics["time"]["global"][:, :repeats_done]
         record = {
             "event": "running_summary",
-            "version": "v4_light",
+            "version": "v4_split_lite",
             "repeats_done": int(repeats_done),
             "FAA_mean": float(acc[-1].mean()),
             "FAA_std": float(acc[-1].std()),
@@ -262,7 +273,7 @@ if __name__ == "__main__":
     # duplicate output stream to output file
     if not os.path.exists(args.log_dir):
         os.makedirs(args.log_dir)
-    log_out = args.log_dir + "/v4_light_output.log"
+    log_out = args.log_dir + "/v4_split_lite_output.log"
     sys.stdout = Logger(log_out)
     effective_logger = EffectiveDataLogger(args.log_dir)
 

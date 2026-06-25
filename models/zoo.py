@@ -490,16 +490,25 @@ class OnePrompt(nn.Module):
 
 
     def get_v1_config(self):
-        """Return v4-light protection defaults."""
+        """Return v4-split-lite protection defaults."""
         return {
-            "lambda_pk": 0.001,
-            "lambda_pv": 0.03,
+            "lambda_pk": 0.0005,
+            "lambda_pv": 0.015,
             "lambda_feat": 0.0,
             "freq_threshold": 0.01,
             "max_feature_memories": 0,
             "route_balance_weight": 2e-4,
             "route_prior_weight": 1e-4,
             "route_prior_momentum": 0.7,
+            "use_split_lite": True,
+            "split_lite_components": ("e_pv",),
+            "split_lite_rank": 4,
+            "split_lite_alpha": 0.2,
+            "split_lite_interval": 20,
+            "split_lite_buffer_size": 24,
+            "split_lite_expert_threshold": 0.03,
+            "split_lite_min_task": 1,
+            "split_lite_basis_decay": 0.7,
             "temperature": 1.0,
             "key_temperature": 2.0,
             "enable_diagnostic_log": False,

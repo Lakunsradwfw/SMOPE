@@ -36,6 +36,7 @@ from .key_relation import (
     save_key_prototypes,
 )
 from .loss_logger import DiagnosticLogger, compute_key_sim_distance
+from .split_lite import SplitLiteProjector
 
 __all__ = [
     "TaskMemory",
@@ -56,4 +57,5 @@ __all__ = [
     "save_key_prototypes",
     "DiagnosticLogger",
     "compute_key_sim_distance",
+    "SplitLiteProjector",
 ]
