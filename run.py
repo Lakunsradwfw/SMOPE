@@ -8,6 +8,7 @@ import argparse
 import torch
 import numpy as np
 import yaml
+import json
 import time, datetime
 import random, pdb
 import pandas as pd
@@ -172,6 +173,82 @@ class Logger(object):
         self.log.flush()
 
 
+class EffectiveDataLogger(object):
+    """Write compact v3-lite signals for the next optimization pass."""
+
+    def __init__(self, log_dir, filename="v3_lite_effective.log"):
+        self.path = os.path.join(log_dir, filename)
+        os.makedirs(log_dir, exist_ok=True)
+        if not os.path.exists(self.path) or os.path.getsize(self.path) == 0:
+            with open(self.path, "w", encoding="utf-8") as f:
+                f.write("# SMoPE v3-lite effective data log\n")
+                f.write("# Main accuracy output is kept in v3_lite_output.log.\n")
+                f.write("# Each JSON line is self-contained for later analysis.\n")
+
+    @staticmethod
+    def _tolist(arr):
+        return np.asarray(arr).tolist()
+
+    def log_repeat(self, repeat_id, seed, total_time_sec, avg_metrics):
+        acc_global = avg_metrics["acc"]["global"][:, repeat_id]
+        fr_global = avg_metrics["fr"]["global"][:, repeat_id]
+        time_global = avg_metrics["time"]["global"][:, repeat_id]
+        acc_pt = avg_metrics["acc"]["pt"][:, :, repeat_id]
+
+        final_task = len(acc_global) - 1
+        final_per_task_acc = acc_pt[:, final_task]
+        best_old_acc = np.max(acc_pt[:, : final_task + 1], axis=1)
+        forgetting_by_task = best_old_acc - final_per_task_acc
+
+        record = {
+            "event": "repeat_summary",
+            "repeat_id": int(repeat_id + 1),
+            "seed": int(seed),
+            "total_time_sec": float(total_time_sec),
+            "total_time_hms": str(datetime.timedelta(seconds=int(total_time_sec))),
+            "faa_by_task": self._tolist(acc_global),
+            "fr_by_task": self._tolist(fr_global),
+            "time_per_epoch_by_task": self._tolist(time_global),
+            "final_per_task_acc": self._tolist(final_per_task_acc),
+            "forgetting_by_task": self._tolist(forgetting_by_task),
+            "final": {
+                "FAA": float(acc_global[-1]),
+                "CAA": float(np.mean(acc_global)),
+                "FR": float(fr_global[-1]),
+                "mean_time_per_epoch": float(np.mean(time_global)),
+            },
+            "diagnostic": {
+                "worst_final_task_id": int(np.argmin(final_per_task_acc) + 1),
+                "worst_final_task_acc": float(np.min(final_per_task_acc)),
+                "max_forgetting_task_id": int(np.argmax(forgetting_by_task) + 1),
+                "max_forgetting": float(np.max(forgetting_by_task)),
+                "late_task_plasticity": float(acc_global[-1] - acc_global[-2])
+                if len(acc_global) > 1
+                else 0.0,
+            },
+        }
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def log_running_summary(self, repeats_done, avg_metrics):
+        acc = avg_metrics["acc"]["global"][:, :repeats_done]
+        fr = avg_metrics["fr"]["global"][:, :repeats_done]
+        time_metric = avg_metrics["time"]["global"][:, :repeats_done]
+        record = {
+            "event": "running_summary",
+            "repeats_done": int(repeats_done),
+            "FAA_mean": float(acc[-1].mean()),
+            "FAA_std": float(acc[-1].std()),
+            "CAA_mean": float(acc.mean(axis=0).mean()),
+            "CAA_std": float(acc.mean(axis=0).std()),
+            "FR_mean": float(fr[-1].mean()),
+            "FR_std": float(fr[-1].std()),
+            "mean_time_per_epoch": float(time_metric.mean()),
+        }
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 if __name__ == "__main__":
     args = get_args(sys.argv[1:])
     print(args)
@@ -183,8 +260,9 @@ if __name__ == "__main__":
     # duplicate output stream to output file
     if not os.path.exists(args.log_dir):
         os.makedirs(args.log_dir)
-    log_out = args.log_dir + "/v3output.log"
+    log_out = args.log_dir + "/v3_lite_output.log"
     sys.stdout = Logger(log_out)
+    effective_logger = EffectiveDataLogger(args.log_dir)
 
     # save args
     with open(args.log_dir + "/args.yaml", "w") as yaml_file:
@@ -284,6 +362,7 @@ if __name__ == "__main__":
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print(f"=== Total time: {total_time_str} ===")
+        effective_logger.log_repeat(r, seed, total_time, avg_metrics)
 
         # save results
         for mkey in metric_keys:
@@ -343,6 +422,7 @@ if __name__ == "__main__":
             "std:",
             avg_metrics["fr"]["global"][-1, : r + 1].std(),
         )
+        effective_logger.log_running_summary(r + 1, avg_metrics)
 
     # write configs and results into xlsx
     file_path = "results.xlsx"
