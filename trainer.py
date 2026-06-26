@@ -160,6 +160,7 @@ class Trainer:
             "pretrained_weight": args.pretrained_weight,
             "split_lite_alpha": args.split_lite_alpha,
             "split_lite_min_task": args.split_lite_min_task,
+            "log_dir": args.log_dir,
         }
         self.learner_type, self.learner_name = args.learner_type, args.learner_name
         self.learner = learners.__dict__[self.learner_type].__dict__[self.learner_name](
