@@ -158,6 +158,8 @@ class Trainer:
             "top_k": self.top_k,
             "prompt_param": [self.num_tasks, args.prompt_param],
             "pretrained_weight": args.pretrained_weight,
+            "split_lite_alpha": args.split_lite_alpha,
+            "split_lite_min_task": args.split_lite_min_task,
         }
         self.learner_type, self.learner_name = args.learner_type, args.learner_name
         self.learner = learners.__dict__[self.learner_type].__dict__[self.learner_name](

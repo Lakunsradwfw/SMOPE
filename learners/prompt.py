@@ -209,6 +209,11 @@ class OnePrompt(Prompt):
         try:
             prompt = self.model.module.prompt if hasattr(self.model, 'module') else self.model.prompt
             self._v1_config = prompt.get_v1_config()
+            # ── Allow CLI overrides for ablation experiments ──
+            if self.config.get("split_lite_alpha") is not None:
+                self._v1_config["split_lite_alpha"] = float(self.config["split_lite_alpha"])
+            if self.config.get("split_lite_min_task") is not None:
+                self._v1_config["split_lite_min_task"] = int(self.config["split_lite_min_task"])
         except Exception:
             self._v1_config = {
                 "lambda_pk": 0.0,

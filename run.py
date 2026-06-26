@@ -102,6 +102,19 @@ def create_args():
         help="maximum number of tasks to run; -1 uses all tasks from config",
     )
 
+    parser.add_argument(
+        "--split_lite_alpha",
+        type=float,
+        default=None,
+        help="override v4 split_lite_alpha (default: 0.2 from model config)",
+    )
+    parser.add_argument(
+        "--split_lite_min_task",
+        type=int,
+        default=None,
+        help="override v4 split_lite_min_task (default: 1 from model config)",
+    )
+
     # new add Args
     parser.add_argument(
         "--adaptive_pred",
