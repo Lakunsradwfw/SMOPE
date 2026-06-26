@@ -451,7 +451,7 @@ if __name__ == "__main__":
         effective_logger.log_running_summary(r + 1, avg_metrics)
 
     # write configs and results into xlsx
-    file_path = "results.xlsx"
+    file_path = args.log_dir + "/results.xlsx"
     content_dict = yaml.load(open(args.log_dir + "/args.yaml", "r"), Loader=yaml.Loader)
     # add results
     content_dict["save_folder"] = args.log_dir.split("/")[-1]
