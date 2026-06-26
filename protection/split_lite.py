@@ -113,6 +113,7 @@ class SplitLiteProjector:
         self.stats["project_calls"] += 1
         self.stats["projected_vectors"] += summary["projected"]
         self.stats["collected_vectors"] += summary["collected"]
+        self._write_json(summary)
         return summary
 
     def finalize_task(self, task_id: int, usage_freq: Optional[torch.Tensor] = None):
@@ -126,7 +127,7 @@ class SplitLiteProjector:
             "interval": int(self.interval),
             "buffer_size": int(self.buffer_size),
             "expert_threshold": float(self.expert_threshold),
-            "active_experts": active,
+            "active_experts": sorted(active),
             "basis_sizes": {},
             "stats": dict(self.stats),
         }
@@ -225,4 +226,17 @@ class SplitLiteProjector:
             return
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
         with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.write(json.dumps(self._jsonable(record), ensure_ascii=False) + "\n")
+
+    def _jsonable(self, value):
+        if isinstance(value, dict):
+            return {str(k): self._jsonable(v) for k, v in value.items()}
+        if isinstance(value, set):
+            return sorted(self._jsonable(v) for v in value)
+        if isinstance(value, (list, tuple)):
+            return [self._jsonable(v) for v in value]
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return value.item()
+            return value.detach().cpu().tolist()
+        return value
