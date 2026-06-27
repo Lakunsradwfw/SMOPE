@@ -1,0 +1,52 @@
+DW: false
+adaptive_pred: true
+batch_size: 128
+ca_batch_size_ratio: 1.0
+ca_lr: 0.0001
+ca_method: multi-centroid
+ca_weight_decay: 0.0005
+config: configs/cifar-100_prompt_smope.yaml
+crct_epochs: 50
+dataroot: data
+dataset: CIFAR100
+debug_mode: 0
+first_split_size: 10
+gpuid:
+- 0
+iter_step: 40
+learner_name: OnePrompt
+learner_type: prompt
+log_dir: outputs/debug_test
+lr: 0.005
+max_task: -1
+memory: 0
+model_name: vit_pt_imnet
+model_type: zoo
+momentum: 0.9
+n_centroids: 1
+optimizer: AdamW
+oracle_flag: false
+other_split_size: 10
+overwrite: 1
+pretrained_weight: sup1k
+prompt_param:
+- 50.0
+- 5.0
+- 1.0e-05
+- 1.0e-05
+- 0.4
+rand_split: true
+repeat: 1
+schedule:
+- 80
+- 0
+- 20
+schedule_type: coswm
+seeds:
+- 0
+temp: 2.0
+train_aug: true
+upper_bound_flag: false
+validation: false
+weight_decay: 0
+workers: 4
