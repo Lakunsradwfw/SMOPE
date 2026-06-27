@@ -214,6 +214,8 @@ class OnePrompt(Prompt):
                 self._v1_config["split_lite_alpha"] = float(self.config["split_lite_alpha"])
             if self.config.get("split_lite_min_task") is not None:
                 self._v1_config["split_lite_min_task"] = int(self.config["split_lite_min_task"])
+            if self.config.get("split_lite_active_topk") is not None:
+                self._v1_config["split_lite_active_topk"] = int(self.config["split_lite_active_topk"])
         except Exception:
             self._v1_config = {
                 "lambda_pk": 0.0,

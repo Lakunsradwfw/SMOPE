@@ -507,6 +507,7 @@ class OnePrompt(nn.Module):
             "split_lite_interval": 20,
             "split_lite_buffer_size": 24,
             "split_lite_expert_threshold": 0.03,
+            "split_lite_active_topk": None,
             "split_lite_min_task": 1,
             "split_lite_basis_decay": 0.7,
             "temperature": 1.0,

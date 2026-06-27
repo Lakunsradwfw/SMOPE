@@ -114,6 +114,12 @@ def create_args():
         default=None,
         help="override v4 split_lite_min_task (default: 1 from model config)",
     )
+    parser.add_argument(
+        "--split_lite_active_topk",
+        type=int,
+        default=None,
+        help="override v4 split_lite_active_topk; limits protected experts per task",
+    )
 
     # new add Args
     parser.add_argument(

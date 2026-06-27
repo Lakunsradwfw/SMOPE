@@ -24,6 +24,7 @@ class SplitLiteProjector:
         interval: int = 20,
         buffer_size: int = 24,
         expert_threshold: float = 0.03,
+        active_topk: Optional[int] = None,
         components: Iterable[str] = ("e_pv",),
         min_task: int = 1,
         basis_decay: float = 0.7,
@@ -34,6 +35,7 @@ class SplitLiteProjector:
         self.interval = max(int(interval), 1)
         self.buffer_size = max(int(buffer_size), self.rank)
         self.expert_threshold = float(expert_threshold)
+        self.active_topk = None if active_topk is None else max(int(active_topk), 1)
         self.components = tuple(components)
         self.min_task = int(min_task)
         self.basis_decay = float(basis_decay)
@@ -66,6 +68,7 @@ class SplitLiteProjector:
             interval=config.get("split_lite_interval", 20),
             buffer_size=config.get("split_lite_buffer_size", 24),
             expert_threshold=config.get("split_lite_expert_threshold", 0.03),
+            active_topk=config.get("split_lite_active_topk"),
             components=components,
             min_task=config.get("split_lite_min_task", 1),
             basis_decay=config.get("split_lite_basis_decay", 0.7),
@@ -127,6 +130,7 @@ class SplitLiteProjector:
             "interval": int(self.interval),
             "buffer_size": int(self.buffer_size),
             "expert_threshold": float(self.expert_threshold),
+            "active_topk": self.active_topk,
             "active_experts": sorted(active),
             "basis_sizes": {},
             "stats": dict(self.stats),
@@ -162,6 +166,13 @@ class SplitLiteProjector:
         if usage_freq is None:
             return set()
         usage = usage_freq.detach().cpu().float()
+        if self.active_topk is not None:
+            positive = torch.nonzero(usage > 0).view(-1)
+            if positive.numel() == 0:
+                return {int(torch.argmax(usage).item())} if usage.numel() > 0 else set()
+            k = min(self.active_topk, int(positive.numel()))
+            _, order = torch.topk(usage[positive], k=k)
+            return set(positive[order].tolist())
         active = set(torch.nonzero(usage >= self.expert_threshold).view(-1).tolist())
         if not active and usage.numel() > 0:
             active.add(int(torch.argmax(usage).item()))
