@@ -740,6 +740,67 @@ python -m py_compile run.py learners/prompt.py models/zoo.py protection/split_li
 
 ---
 
+### 2.10 v5-transient-prompt 版本设计记录（2026-06-30）
+
+> **版本**：v5-transient-prompt — 在 v4-split-lite 上加入 CP-MoE 式瞬态 prompt 探针。  
+> **核心判断**：不需要等 `split_lite_alpha / min_task / active_topk` 完整调完再加入瞬态 prompt。瞬态 prompt 改变的是任务开始前的 expert 兼容性估计和保护强度分配，会改变 v4 超参的最优区间；因此应先接入 v5，再做分阶段消融。
+
+#### 2.10.1 机制定位
+
+v5 不把 transient prompt 作为长期新增容量，而是作为每个新任务开始前的短 warm-up 探针：
+
+1. 冻结 backbone、classifier 和稳定 SMoPE prompt，只临时更新 `e_pv`。
+2. 用少量 batch 估计当前任务对各 expert 的 task-local 梯度重要性。
+3. 立刻恢复原 `e_pv` 权重，丢弃瞬态更新。
+4. 只保留 expert-level `cp_scores`，用于正式训练阶段。
+
+这样保留 CP-MoE 的 assess-then-update 思想，同时不破坏 v4 的三组件主线。
+
+#### 2.10.2 与 v4 三组件的融合方式
+
+- **Router / Gating**：把 `cp_scores` 转成 centered bias，加到训练期 prompt expert top-k score 上，使新任务更倾向选择瞬态探针认为兼容的 expert。
+- **Expert Value / Split-lite**：把 `cp_scores` 转成 expert-wise protection scale，同时调节 e_pv anchor 正则和 split-lite 投影强度。
+- **Key / Prototype**：仍默认不启用昂贵 feature distill，只把 transient 结果写入独立日志和 TaskMemory，供后续诊断。
+
+正式训练仍是 v4 的单阶段联合优化：`CE + router balance/prior + e_pv anchor`，并在 `backward()` 后、`optimizer.step()` 前执行 split-lite projection。瞬态 prompt 只在正式训练前单独 warm-up。
+
+#### 2.10.3 新增文件与改动
+
+| 文件 | 变更内容 |
+|------|---------|
+| `protection/transient_prompt.py` | 新增 `TransientPromptProbe`，实现短 warm-up、权重恢复、`cp_scores` 计算和 JSONL 日志 |
+| `models/zoo.py` | `OnePrompt` 新增 transient CP score 缓存、router score bias、protection scale 接口 |
+| `models/vit.py` | Attention prompt 输入支持可选 score bias |
+| `protection/gradient_projection.py` | e_pv anchor 正则支持 expert-wise scale |
+| `protection/split_lite.py` | split-lite projection 支持 expert-wise alpha scale |
+| `learners/prompt.py` | 任务正式训练前运行 transient probe，并写入 TaskMemory |
+| `run.py` / `trainer.py` | 新增 v5 CLI 参数；修复 `split_lite_active_topk` 未传入 learner config 的问题 |
+
+#### 2.10.4 日志
+
+v5 使用 `--experiment_version` 区分日志：
+
+```text
+{version}_output.log       # 主训练输出
+{version}_effective.log    # FAA/CAA/FR/耗时摘要
+{version}_projection.log   # split-lite 投影诊断
+{version}_transient.log    # transient prompt 探针诊断
+```
+
+`{version}_transient.log` 每个任务记录 `warmup_batches`、`steps`、`mean_loss`、`cp_scores`、`importance_sum`。
+
+#### 2.10.5 消融脚本
+
+```text
+experiments/cifar-100_v5_exp1_v4_delay_topk.sh      # v4 delayed/topk 对照
+experiments/cifar-100_v5_exp2_transient_bias.sh     # 只加 transient router bias
+experiments/cifar-100_v5_exp3_transient_full.sh     # router bias + e_pv protection scaling
+```
+
+推荐先跑 `MAX_TASK=5, REPEAT=5`，若 `v5_exp3` 的 CAA/FAA 趋势明显优于 `v5_exp1`，再扩展到 `MAX_TASK=10` 和正式 `CRCT_EPOCHS=50`。
+
+---
+
 ## 3. 统一设计原则：Activation-Weighted Stability-Plasticity Trade-off
 
 > v3 更新：每个参数子空间的保护强度与其在旧任务中的**激活频率**成正比。

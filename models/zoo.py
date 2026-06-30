@@ -56,6 +56,12 @@ class OnePrompt(nn.Module):
             "expert_usage_prior",
             torch.ones(self.num_experts, dtype=torch.float32) / self.num_experts,
         )
+        self.register_buffer(
+            "transient_cp_scores",
+            torch.ones(self.num_experts, dtype=torch.float32) / self.num_experts,
+        )
+        self.transient_cp_bias_weight = 0.0
+        self.transient_protect_scale = 0.0
 
     def process_task_count(self):
         self.task_count += 1
@@ -191,6 +197,44 @@ class OnePrompt(nn.Module):
         usage = usage.clamp_min(1e-8)
         return (usage * (usage.log() + math.log(self.num_experts))).sum()
 
+    def set_transient_cp_scores(
+        self,
+        scores,
+        bias_weight: float = 0.0,
+        protect_scale: float = 0.0,
+    ):
+        """Install task-local transient compatibility scores for v5."""
+        if scores is None:
+            self.clear_transient_cp_scores()
+            return
+        scores = torch.as_tensor(
+            scores,
+            dtype=self.transient_cp_scores.dtype,
+            device=self.transient_cp_scores.device,
+        )
+        if scores.numel() != self.num_experts or float(scores.sum()) <= 0:
+            self.clear_transient_cp_scores()
+            return
+        scores = scores.clamp_min(0.0)
+        scores = scores / scores.sum().clamp_min(1e-12)
+        self.transient_cp_scores.copy_(scores)
+        self.transient_cp_bias_weight = float(bias_weight)
+        self.transient_protect_scale = float(protect_scale)
+
+    def clear_transient_cp_scores(self):
+        self.transient_cp_scores.fill_(1.0 / max(self.num_experts, 1))
+        self.transient_cp_bias_weight = 0.0
+        self.transient_protect_scale = 0.0
+
+    def get_transient_protection_scale(self):
+        """Return expert-wise protection multipliers centered near 1."""
+        scale = self.transient_cp_scores.detach().float()
+        if self.transient_protect_scale <= 0:
+            return None
+        scale = scale / scale.mean().clamp_min(1e-12)
+        scale = 1.0 + self.transient_protect_scale * (scale - 1.0)
+        return scale.clamp_min(0.0)
+
     def get_expert_usage_freq(self):
         counts = torch.zeros(self.num_experts, dtype=torch.float32)
         for e in self.e_layers:
@@ -250,12 +294,24 @@ class OnePrompt(nn.Module):
             eps_decay = torch.tensor(
                 eps_decay, device=pk.device, dtype=torch.float32
             )  # (num_heads, num_experts)
+            score_bias = None
+            if train and self.transient_cp_bias_weight > 0:
+                cp_scores = self.transient_cp_scores.to(pk.device, dtype=pk.dtype)
+                cp_scores = cp_scores / cp_scores.sum().clamp_min(1e-12)
+                cp_scores = cp_scores / cp_scores.mean().clamp_min(1e-12) - 1.0
+                score_bias = (
+                    self.transient_cp_bias_weight
+                    * cp_scores.view(1, 1, 1, self.num_experts)
+                )
             Ek = pk.unsqueeze(0).expand(B, -1, -1, -1)
             Ev = pv.unsqueeze(0).expand(B, -1, -1, -1)
 
         # combine prompts for prefix tuning
         if e_valid:
-            p_return = [Ek, Ev, eps_decay]
+            if score_bias is not None:
+                p_return = [Ek, Ev, eps_decay, score_bias]
+            else:
+                p_return = [Ek, Ev, eps_decay]
         else:
             p_return = None
 
@@ -510,6 +566,12 @@ class OnePrompt(nn.Module):
             "split_lite_active_topk": None,
             "split_lite_min_task": 1,
             "split_lite_basis_decay": 0.7,
+            "use_transient_prompt": False,
+            "transient_warmup_batches": 20,
+            "transient_lr": 1e-3,
+            "transient_min_task": 1,
+            "transient_cp_bias_weight": 0.1,
+            "transient_protect_scale": 1.0,
             "temperature": 1.0,
             "key_temperature": 2.0,
             "enable_diagnostic_log": False,

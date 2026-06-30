@@ -47,6 +47,7 @@ from protection.loss_logger import (
     compute_feature_drift_for_memory,
 )
 from protection.split_lite import SplitLiteProjector
+from protection.transient_prompt import TransientPromptProbe
 
 
 class Prompt(NormalNN):
@@ -200,6 +201,8 @@ class OnePrompt(Prompt):
         self._batch_count = 0  # global batch counter for logging
         self._task_epoch_count = 0  # epoch counter within current task
         self._split_lite_projector = None
+        self._transient_probe = None
+        self._transient_cp_scores = None
         # ── v3: no incremental subspace estimator needed ──
 
     def _init_v1_config(self):
@@ -216,6 +219,16 @@ class OnePrompt(Prompt):
                 self._v1_config["split_lite_min_task"] = int(self.config["split_lite_min_task"])
             if self.config.get("split_lite_active_topk") is not None:
                 self._v1_config["split_lite_active_topk"] = int(self.config["split_lite_active_topk"])
+            for cfg_key in (
+                "use_transient_prompt",
+                "transient_warmup_batches",
+                "transient_lr",
+                "transient_min_task",
+                "transient_cp_bias_weight",
+                "transient_protect_scale",
+            ):
+                if self.config.get(cfg_key) is not None:
+                    self._v1_config[cfg_key] = self.config[cfg_key]
         except Exception:
             self._v1_config = {
                 "lambda_pk": 0.0,
@@ -226,6 +239,7 @@ class OnePrompt(Prompt):
                 "key_temperature": 2.0,
                 "max_feature_memories": 4,
                 "enable_diagnostic_log": False,
+                "use_transient_prompt": False,
             }
         print(f"[DEBUG] v1_config = {self._v1_config}")
         for cfg_key, attr in (
@@ -236,21 +250,66 @@ class OnePrompt(Prompt):
             if cfg_key in self._v1_config and hasattr(prompt, attr):
                 setattr(prompt, attr, self._v1_config[cfg_key])
         if self._split_lite_projector is None and self._v1_config.get("use_split_lite", False):
+            version = self.config.get("experiment_version", "v4_split_lite")
             split_log = os.path.join(
                 self.config.get("log_dir", "."),
-                "v4_split_lite_projection.log",
+                f"{version}_projection.log",
             )
             self._split_lite_projector = SplitLiteProjector.from_config(
                 self._v1_config,
                 log_path=split_log,
             )
+        if self._transient_probe is None and self._v1_config.get("use_transient_prompt", False):
+            version = self.config.get("experiment_version", "v4_split_lite")
+            transient_log = os.path.join(
+                self.config.get("log_dir", "."),
+                f"{version}_transient.log",
+            )
+            self._transient_probe = TransientPromptProbe.from_config(
+                self._v1_config,
+                log_path=transient_log,
+            )
 
         # ── v2: Lazy init DiagnosticLogger ──
         if self._diag_logger is None and self._v1_config.get("enable_diagnostic_log", False):
             self._diag_logger = DiagnosticLogger(
-                log_dir="outputs/cifar-100/10-task/one-prompt",
+                log_dir=self.config.get("log_dir", "outputs/cifar-100/10-task/one-prompt"),
                 log_interval_batches=self._v1_config.get("diagnostic_log_interval", 50),
             )
+
+    def _run_transient_prompt_probe(self, train_loader):
+        self._init_v1_config()
+        if self._transient_probe is None:
+            return
+        if not self._transient_probe.should_run(self.task_count):
+            return
+        prompt = self.model.module.prompt if hasattr(self.model, 'module') else self.model.prompt
+        scores, record = self._transient_probe.run(
+            self.model,
+            train_loader,
+            self.criterion,
+            task_id=self.task_count,
+            last_valid_out_dim=self.last_valid_out_dim,
+            valid_out_dim=self.valid_out_dim,
+            dw_k=self.dw_k,
+            cls_mean=self.cls_mean,
+            gpu=self.gpu,
+        )
+        self._transient_cp_scores = scores.detach().cpu()
+        prompt.set_transient_cp_scores(
+            self._transient_cp_scores,
+            bias_weight=self._v1_config.get("transient_cp_bias_weight", 0.0),
+            protect_scale=self._v1_config.get("transient_protect_scale", 0.0),
+        )
+        if self._split_lite_projector is not None:
+            self._split_lite_projector.set_expert_alpha_scale(
+                prompt.get_transient_protection_scale()
+            )
+        print(
+            "[v5-transient] Task "
+            f"{self.task_count} probe ready: steps={record.get('steps', 0)}, "
+            f"max_cp={float(self._transient_cp_scores.max()):.4f}"
+        )
 
     def create_model(self):
         cfg = self.config
@@ -392,8 +451,11 @@ class OnePrompt(Prompt):
             if self._pv_l2_anchor is None:
                 self._refresh_l2_anchors(prompt)
             anchors, weights, normalizer = self._pv_l2_anchor or (None, None, 0)
+            expert_scale = None
+            if hasattr(prompt, "get_transient_protection_scale"):
+                expert_scale = prompt.get_transient_protection_scale()
             L_pv = compute_pv_l2_reg_from_anchor(
-                prompt, anchors, weights, normalizer
+                prompt, anchors, weights, normalizer, expert_scale=expert_scale
             )
             L_pv_val = L_pv.detach().clone()
             if not torch.isnan(L_pv) and not torch.isinf(L_pv):
@@ -574,6 +636,8 @@ class OnePrompt(Prompt):
 
             batch_time = AverageMeter()
 
+            self._run_transient_prompt_probe(train_loader)
+
             if self.task_count == 0:
                 print("-" * 10)
                 print("Initial training...")
@@ -663,6 +727,8 @@ class OnePrompt(Prompt):
             num_experts=prompt.num_experts,
             device=device,
         )
+        if self._transient_cp_scores is not None:
+            memory.transient_cp_scores = self._transient_cp_scores.detach().cpu().clone()
 
         # ── v3 组件一：保存 e_pk 权重快照 ──
         if v1.get("lambda_pk", 0.0) > 0:

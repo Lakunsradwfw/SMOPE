@@ -103,7 +103,11 @@ class Attention(nn.Module):
         prompt_score_label_ = None
 
         if prompt is not None:
-            if len(prompt) == 3:
+            score_bias = None
+            if len(prompt) == 4:
+                pk, pv, eps_decay, score_bias = prompt
+                prompt_length = pk.size(2)
+            elif len(prompt) == 3:
                 pk, pv, eps_decay = prompt
                 prompt_length = pk.size(2)
             else:
@@ -126,6 +130,8 @@ class Attention(nn.Module):
                 prompt_score_attn = q_prompt @ pk.transpose(
                     -2, -1
                 )  # (B, num_heads, 1, num_prompt)
+                if score_bias is not None:
+                    prompt_score_attn = prompt_score_attn + score_bias
                 prompt_score_ = prompt_score_attn
 
                 attn = torch.cat(

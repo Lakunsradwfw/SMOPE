@@ -156,6 +156,7 @@ def compute_pv_l2_reg_from_anchor(
     anchors: Optional[dict],
     weight_sums: Optional[dict],
     normalizer: int,
+    expert_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute e_pv L2 regularization from a consolidated anchor."""
     device = next(prompt.parameters()).device
@@ -168,12 +169,27 @@ def compute_pv_l2_reg_from_anchor(
         if "e_pv" not in name or name not in anchors:
             continue
         anchor = anchors[name].to(device)
-        total_loss = total_loss + float(weight_sums[name]) * F.mse_loss(p, anchor)
+        weight = float(weight_sums[name])
+        if expert_scale is not None:
+            expert_idx = _parse_pv_expert_idx(name)
+            if expert_idx is not None and expert_idx < len(expert_scale):
+                weight *= float(expert_scale[expert_idx].detach().cpu())
+        total_loss = total_loss + weight * F.mse_loss(p, anchor)
         count += 1
 
     if count == 0:
         return torch.tensor(0.0, device=device)
     return total_loss / float(normalizer)
+
+
+def _parse_pv_expert_idx(param_name: str) -> Optional[int]:
+    parts = param_name.split("_")
+    if len(parts) >= 4 and parts[0] == "e" and parts[1] == "pv":
+        try:
+            return int(parts[3])
+        except (ValueError, IndexError):
+            return None
+    return None
 
 
 def _get_pv_expert_weight(

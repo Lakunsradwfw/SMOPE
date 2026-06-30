@@ -37,6 +37,7 @@ from .key_relation import (
 )
 from .loss_logger import DiagnosticLogger, compute_key_sim_distance
 from .split_lite import SplitLiteProjector
+from .transient_prompt import TransientPromptProbe
 
 __all__ = [
     "TaskMemory",
@@ -58,4 +59,5 @@ __all__ = [
     "DiagnosticLogger",
     "compute_key_sim_distance",
     "SplitLiteProjector",
+    "TransientPromptProbe",
 ]

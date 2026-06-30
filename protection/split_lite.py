@@ -53,6 +53,7 @@ class SplitLiteProjector:
             "collected_vectors": 0,
             "skipped_steps": 0,
         }
+        self.expert_alpha_scale = None
 
     @classmethod
     def from_config(cls, config: dict, log_path: Optional[str] = None):
@@ -101,10 +102,11 @@ class SplitLiteProjector:
                 if task_id >= self.min_task and basis is not None and basis.numel() > 0:
                     basis = basis.to(grad_vec.device, dtype=grad_vec.dtype)
                     projection = basis.t().matmul(basis.matmul(grad_vec))
-                    projected_grad = grad_vec - self.alpha * projection
+                    alpha = self._alpha_for_expert(expert_idx, grad_vec.device)
+                    projected_grad = grad_vec - alpha * projection
                     self._write_expert_grad(projected_grad, slices)
                     denom = grad_vec.norm().clamp_min(1e-12)
-                    removed_ratios.append(float((self.alpha * projection).norm() / denom))
+                    removed_ratios.append(float((alpha * projection).norm() / denom))
                     summary["projected"] += 1
 
                 self._append_buffer(comp, expert_idx, grad_vec.detach().cpu())
@@ -118,6 +120,20 @@ class SplitLiteProjector:
         self.stats["collected_vectors"] += summary["collected"]
         self._write_json(summary)
         return summary
+
+    def set_expert_alpha_scale(self, scale: Optional[torch.Tensor]):
+        if scale is None:
+            self.expert_alpha_scale = None
+        else:
+            self.expert_alpha_scale = scale.detach().cpu().float()
+
+    def _alpha_for_expert(self, expert_idx: int, device):
+        alpha = torch.tensor(float(self.alpha), device=device)
+        if self.expert_alpha_scale is None:
+            return alpha
+        if expert_idx < len(self.expert_alpha_scale):
+            alpha = alpha * self.expert_alpha_scale[expert_idx].to(device)
+        return alpha.clamp_min(0.0)
 
     def finalize_task(self, task_id: int, usage_freq: Optional[torch.Tensor] = None):
         """Build/merge low-rank bases from the current task gradient buffers."""

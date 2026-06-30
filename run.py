@@ -120,6 +120,47 @@ def create_args():
         default=None,
         help="override v4 split_lite_active_topk; limits protected experts per task",
     )
+    parser.add_argument(
+        "--experiment_version",
+        type=str,
+        default="v4_split_lite",
+        help="prefix for output/effective/auxiliary logs",
+    )
+    parser.add_argument(
+        "--use_transient_prompt",
+        action="store_true",
+        help="enable v5 transient prompt warm-up probe",
+    )
+    parser.add_argument(
+        "--transient_warmup_batches",
+        type=int,
+        default=None,
+        help="number of batches for the transient prompt probe",
+    )
+    parser.add_argument(
+        "--transient_lr",
+        type=float,
+        default=None,
+        help="learning rate for transient prompt warm-up",
+    )
+    parser.add_argument(
+        "--transient_min_task",
+        type=int,
+        default=None,
+        help="first task index that runs the transient prompt probe",
+    )
+    parser.add_argument(
+        "--transient_cp_bias_weight",
+        type=float,
+        default=None,
+        help="router logit bias strength from transient compatibility scores",
+    )
+    parser.add_argument(
+        "--transient_protect_scale",
+        type=float,
+        default=None,
+        help="expert-wise e_pv anchor/projection scaling strength",
+    )
 
     # new add Args
     parser.add_argument(
@@ -201,13 +242,14 @@ class Logger(object):
 class EffectiveDataLogger(object):
     """Write compact v4-split-lite signals for the next optimization pass."""
 
-    def __init__(self, log_dir, filename="v4_split_lite_effective.log"):
-        self.path = os.path.join(log_dir, filename)
+    def __init__(self, log_dir, version="v4_split_lite"):
+        self.version = version
+        self.path = os.path.join(log_dir, f"{version}_effective.log")
         os.makedirs(log_dir, exist_ok=True)
         if not os.path.exists(self.path) or os.path.getsize(self.path) == 0:
             with open(self.path, "w", encoding="utf-8") as f:
-                f.write("# SMoPE v4-split-lite effective data log\n")
-                f.write("# Main accuracy output is kept in v4_split_lite_output.log.\n")
+                f.write(f"# SMoPE {version} effective data log\n")
+                f.write(f"# Main accuracy output is kept in {version}_output.log.\n")
                 f.write("# Each JSON line is self-contained for later analysis.\n")
 
     @staticmethod
@@ -227,11 +269,12 @@ class EffectiveDataLogger(object):
 
         record = {
             "event": "repeat_summary",
-            "version": "v4_split_lite",
+            "version": self.version,
             "repeat_id": int(repeat_id + 1),
             "seed": int(seed),
             "aux_logs": {
-                "projection": "v4_split_lite_projection.log",
+                "projection": f"{self.version}_projection.log",
+                "transient": f"{self.version}_transient.log",
             },
             "total_time_sec": float(total_time_sec),
             "total_time_hms": str(datetime.timedelta(seconds=int(total_time_sec))),
@@ -267,7 +310,7 @@ class EffectiveDataLogger(object):
         time_metric = avg_metrics["time"]["global"][:, :repeats_done]
         record = {
             "event": "running_summary",
-            "version": "v4_split_lite",
+            "version": self.version,
             "repeats_done": int(repeats_done),
             "FAA_mean": float(acc[-1].mean()),
             "FAA_std": float(acc[-1].std()),
@@ -292,9 +335,9 @@ if __name__ == "__main__":
     # duplicate output stream to output file
     if not os.path.exists(args.log_dir):
         os.makedirs(args.log_dir)
-    log_out = args.log_dir + "/v4_split_lite_output.log"
+    log_out = args.log_dir + f"/{args.experiment_version}_output.log"
     sys.stdout = Logger(log_out)
-    effective_logger = EffectiveDataLogger(args.log_dir)
+    effective_logger = EffectiveDataLogger(args.log_dir, version=args.experiment_version)
 
     # save args
     with open(args.log_dir + "/args.yaml", "w") as yaml_file:

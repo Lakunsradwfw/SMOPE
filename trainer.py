@@ -160,6 +160,14 @@ class Trainer:
             "pretrained_weight": args.pretrained_weight,
             "split_lite_alpha": args.split_lite_alpha,
             "split_lite_min_task": args.split_lite_min_task,
+            "split_lite_active_topk": args.split_lite_active_topk,
+            "experiment_version": args.experiment_version,
+            "use_transient_prompt": args.use_transient_prompt,
+            "transient_warmup_batches": args.transient_warmup_batches,
+            "transient_lr": args.transient_lr,
+            "transient_min_task": args.transient_min_task,
+            "transient_cp_bias_weight": args.transient_cp_bias_weight,
+            "transient_protect_scale": args.transient_protect_scale,
             "log_dir": args.log_dir,
         }
         self.learner_type, self.learner_name = args.learner_type, args.learner_name
