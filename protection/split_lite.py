@@ -25,6 +25,7 @@ class SplitLiteProjector:
         buffer_size: int = 24,
         expert_threshold: float = 0.03,
         active_topk: Optional[int] = None,
+        strict_current_topk: bool = False,
         components: Iterable[str] = ("e_pv",),
         min_task: int = 1,
         basis_decay: float = 0.7,
@@ -36,10 +37,12 @@ class SplitLiteProjector:
         self.buffer_size = max(int(buffer_size), self.rank)
         self.expert_threshold = float(expert_threshold)
         self.active_topk = None if active_topk is None else max(int(active_topk), 1)
+        self.strict_current_topk = bool(strict_current_topk)
         self.components = tuple(components)
         self.min_task = int(min_task)
         self.basis_decay = float(basis_decay)
         self.log_path = log_path
+        self.current_active_experts = None
 
         self.bases: Dict[str, Dict[int, torch.Tensor]] = {
             comp: {} for comp in self.components
@@ -70,6 +73,7 @@ class SplitLiteProjector:
             buffer_size=config.get("split_lite_buffer_size", 24),
             expert_threshold=config.get("split_lite_expert_threshold", 0.03),
             active_topk=config.get("split_lite_active_topk"),
+            strict_current_topk=config.get("split_lite_strict_current_topk", False),
             components=components,
             min_task=config.get("split_lite_min_task", 1),
             basis_decay=config.get("split_lite_basis_decay", 0.7),
@@ -89,6 +93,10 @@ class SplitLiteProjector:
             "projected": 0,
             "collected": 0,
             "mean_removed_ratio": 0.0,
+            "strict_current_topk": self.strict_current_topk,
+            "project_active_experts": sorted(self.current_active_experts)
+            if self.current_active_experts is not None
+            else None,
         }
         removed_ratios = []
 
@@ -99,7 +107,20 @@ class SplitLiteProjector:
                     continue
 
                 basis = self.bases.get(comp, {}).get(expert_idx)
-                if task_id >= self.min_task and basis is not None and basis.numel() > 0:
+                should_project = (
+                    task_id >= self.min_task
+                    and basis is not None
+                    and basis.numel() > 0
+                )
+                if (
+                    should_project
+                    and self.strict_current_topk
+                    and self.current_active_experts is not None
+                    and expert_idx not in self.current_active_experts
+                ):
+                    should_project = False
+
+                if should_project:
                     basis = basis.to(grad_vec.device, dtype=grad_vec.dtype)
                     projection = basis.t().matmul(basis.matmul(grad_vec))
                     alpha = self._alpha_for_expert(expert_idx, grad_vec.device)
@@ -147,6 +168,7 @@ class SplitLiteProjector:
             "buffer_size": int(self.buffer_size),
             "expert_threshold": float(self.expert_threshold),
             "active_topk": self.active_topk,
+            "strict_current_topk": self.strict_current_topk,
             "active_experts": sorted(active),
             "basis_sizes": {},
             "stats": dict(self.stats),
@@ -175,6 +197,7 @@ class SplitLiteProjector:
             summary["basis_sizes"][comp] = comp_sizes
             self.buffers[comp].clear()
 
+        self.current_active_experts = set(active)
         self._write_json(summary)
         return summary
 

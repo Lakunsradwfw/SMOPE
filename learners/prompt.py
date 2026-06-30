@@ -219,6 +219,8 @@ class OnePrompt(Prompt):
                 self._v1_config["split_lite_min_task"] = int(self.config["split_lite_min_task"])
             if self.config.get("split_lite_active_topk") is not None:
                 self._v1_config["split_lite_active_topk"] = int(self.config["split_lite_active_topk"])
+            if self.config.get("split_lite_strict_current_topk"):
+                self._v1_config["split_lite_strict_current_topk"] = True
             for cfg_key in (
                 "use_transient_prompt",
                 "transient_warmup_batches",

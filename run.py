@@ -121,6 +121,11 @@ def create_args():
         help="override v4 split_lite_active_topk; limits protected experts per task",
     )
     parser.add_argument(
+        "--split_lite_strict_current_topk",
+        action="store_true",
+        help="project only the latest active top-k experts instead of all experts with historical bases",
+    )
+    parser.add_argument(
         "--experiment_version",
         type=str,
         default="v4_split_lite",

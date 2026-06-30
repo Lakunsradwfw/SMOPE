@@ -161,6 +161,7 @@ class Trainer:
             "split_lite_alpha": args.split_lite_alpha,
             "split_lite_min_task": args.split_lite_min_task,
             "split_lite_active_topk": args.split_lite_active_topk,
+            "split_lite_strict_current_topk": args.split_lite_strict_current_topk,
             "experiment_version": args.experiment_version,
             "use_transient_prompt": args.use_transient_prompt,
             "transient_warmup_batches": args.transient_warmup_batches,
