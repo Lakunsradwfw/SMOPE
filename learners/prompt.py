@@ -1,4 +1,5 @@
 from __future__ import print_function
+import json
 import math
 import torch
 import torch.nn as nn
@@ -203,6 +204,7 @@ class OnePrompt(Prompt):
         self._split_lite_projector = None
         self._transient_probe = None
         self._transient_cp_scores = None
+        self._last_usage_top_active = None
         # ── v3: no incremental subspace estimator needed ──
 
     def _init_v1_config(self):
@@ -221,6 +223,8 @@ class OnePrompt(Prompt):
                 self._v1_config["split_lite_active_topk"] = int(self.config["split_lite_active_topk"])
             if self.config.get("split_lite_strict_current_topk"):
                 self._v1_config["split_lite_strict_current_topk"] = True
+            if self.config.get("expert_usage_mode") is not None:
+                self._v1_config["expert_usage_mode"] = self.config["expert_usage_mode"]
             for cfg_key in (
                 "use_transient_prompt",
                 "transient_warmup_batches",
@@ -242,6 +246,8 @@ class OnePrompt(Prompt):
                 "max_feature_memories": 4,
                 "enable_diagnostic_log": False,
                 "use_transient_prompt": False,
+                "expert_usage_mode": "cumulative",
+                "enable_usage_diagnostics": True,
             }
         print(f"[DEBUG] v1_config = {self._v1_config}")
         for cfg_key, attr in (
@@ -312,6 +318,178 @@ class OnePrompt(Prompt):
             f"{self.task_count} probe ready: steps={record.get('steps', 0)}, "
             f"max_cp={float(self._transient_cp_scores.max()):.4f}"
         )
+
+    def _usage_log_path(self):
+        version = self.config.get("experiment_version", "v4_split_lite")
+        return os.path.join(self.config.get("log_dir", "."), f"{version}_usage.log")
+
+    def _write_jsonl(self, path, record):
+        if not path:
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _top_indices(self, values, k):
+        if values is None:
+            return []
+        values = values.detach().cpu().float()
+        if values.numel() == 0:
+            return []
+        k = max(1, min(int(k), int(values.numel())))
+        return [int(x) for x in torch.argsort(values, descending=True)[:k].tolist()]
+
+    def _jaccard(self, a, b):
+        a = set(a or [])
+        b = set(b or [])
+        if not a and not b:
+            return 1.0
+        return float(len(a & b) / max(len(a | b), 1))
+
+    def _usage_stats(self, usage, topk):
+        if usage is None:
+            return None
+        usage = usage.detach().cpu().float()
+        usage = usage / usage.sum().clamp_min(1e-12)
+        top3 = self._top_indices(usage, 3)
+        top5 = self._top_indices(usage, 5)
+        top_active = self._top_indices(usage, topk)
+        return {
+            "vector": usage.tolist(),
+            "top3": top3,
+            "top5": top5,
+            "top_active": top_active,
+            "top3_mass": float(usage[top3].sum()) if top3 else 0.0,
+            "top5_mass": float(usage[top5].sum()) if top5 else 0.0,
+            "entropy": float(-(usage * (usage + 1e-12).log()).sum()),
+            "max_entropy": float(math.log(max(int(usage.numel()), 1))),
+        }
+
+    def _active_set_from_usage(self, usage, topk, threshold):
+        if usage is None:
+            return set()
+        usage = usage.detach().cpu().float()
+        if topk is not None:
+            return set(self._top_indices(usage, topk))
+        active = set(torch.nonzero(usage >= float(threshold)).view(-1).tolist())
+        if not active and usage.numel() > 0:
+            active.add(int(torch.argmax(usage).item()))
+        return active
+
+    def _build_old_union_usage(self, current_usage):
+        if current_usage is None:
+            return None
+        topk = self._v1_config.get("split_lite_active_topk")
+        threshold = self._v1_config.get("split_lite_expert_threshold", 0.03)
+        union_score = torch.zeros_like(current_usage.detach().cpu().float())
+        all_usages = [
+            mem.expert_usage_freq.detach().cpu().float()
+            for mem in self.old_memories
+            if mem.expert_usage_freq is not None
+        ]
+        all_usages.append(current_usage.detach().cpu().float())
+        for usage in all_usages:
+            usage = usage / usage.sum().clamp_min(1e-12)
+            active = self._active_set_from_usage(usage, topk, threshold)
+            for idx in active:
+                union_score[idx] += usage[idx]
+        if union_score.sum() <= 0:
+            return current_usage.detach().cpu().float()
+        return union_score / union_score.sum().clamp_min(1e-12)
+
+    def _collect_expert_usage_info(self, prompt, train_loader, device):
+        topk = self._v1_config.get("split_lite_active_topk")
+        if topk is None:
+            topk = getattr(prompt, "topk", 5)
+        topk = min(max(int(topk), 1), int(prompt.num_experts))
+
+        cumulative_usage = None
+        if hasattr(prompt, "get_expert_usage_freq"):
+            cumulative_usage = prompt.get_expert_usage_freq().detach().cpu()
+        task_usage = save_expert_usage_freqs(self.model, train_loader, device).detach().cpu()
+        if cumulative_usage is None:
+            cumulative_usage = task_usage.clone()
+        old_union_usage = self._build_old_union_usage(task_usage)
+
+        mode = self._v1_config.get("expert_usage_mode", "cumulative")
+        if mode == "task":
+            selected_usage = task_usage
+            memory_usage = task_usage
+        elif mode == "old_union":
+            selected_usage = old_union_usage
+            memory_usage = task_usage
+        else:
+            selected_usage = cumulative_usage
+            memory_usage = cumulative_usage
+
+        cp_scores = (
+            self._transient_cp_scores.detach().cpu()
+            if self._transient_cp_scores is not None
+            else None
+        )
+        route_topk = min(int(getattr(prompt, "topk", topk)), int(prompt.num_experts))
+        selected_top_active = self._top_indices(selected_usage, topk)
+        task_route_top = self._top_indices(task_usage, route_topk)
+        cp_top_active = self._top_indices(cp_scores, topk) if cp_scores is not None else []
+        cp_route_top = self._top_indices(cp_scores, route_topk) if cp_scores is not None else []
+
+        record = {
+            "event": "expert_usage_task_finish",
+            "task_id": int(self.task_count),
+            "expert_usage_mode": mode,
+            "active_topk": int(topk),
+            "route_topk": int(route_topk),
+            "cumulative_usage": self._usage_stats(cumulative_usage, topk),
+            "task_usage": self._usage_stats(task_usage, topk),
+            "old_union_usage": self._usage_stats(old_union_usage, topk),
+            "selected_usage": self._usage_stats(selected_usage, topk),
+            "previous_selected_jaccard": self._jaccard(
+                self._last_usage_top_active,
+                selected_top_active,
+            ),
+            "cp_overlap": None,
+        }
+        if cp_scores is not None:
+            record["cp_scores"] = self._usage_stats(cp_scores, topk)
+            record["cp_overlap"] = {
+                "cp_top_active_vs_task_top_active": self._jaccard(
+                    cp_top_active,
+                    self._top_indices(task_usage, topk),
+                ),
+                "cp_route_top_vs_task_route_top": self._jaccard(
+                    cp_route_top,
+                    task_route_top,
+                ),
+            }
+
+        self._last_usage_top_active = selected_top_active
+        return selected_usage, memory_usage, record
+
+    def _log_transient_overlap(self, usage_record, split_summary):
+        if self._transient_probe is None or self._transient_cp_scores is None:
+            return
+        protected = split_summary.get("active_experts", []) if split_summary else []
+        selected = usage_record.get("selected_usage") or {}
+        cp_stats = usage_record.get("cp_scores") or {}
+        record = {
+            "event": "transient_overlap",
+            "task_id": int(self.task_count),
+            "expert_usage_mode": usage_record.get("expert_usage_mode"),
+            "active_topk": usage_record.get("active_topk"),
+            "route_topk": usage_record.get("route_topk"),
+            "cp_top_active": cp_stats.get("top_active", []),
+            "task_top_active": (usage_record.get("task_usage") or {}).get("top_active", []),
+            "selected_top_active": selected.get("top_active", []),
+            "protected_experts": protected,
+            "cp_vs_task_active_jaccard": (usage_record.get("cp_overlap") or {}).get(
+                "cp_top_active_vs_task_top_active"
+            ),
+            "cp_vs_protected_jaccard": self._jaccard(
+                cp_stats.get("top_active", []),
+                protected,
+            ),
+        }
+        self._transient_probe.write_record(record)
 
     def create_model(self):
         cfg = self.config
@@ -777,13 +955,15 @@ class OnePrompt(Prompt):
 
         # ── Expert 使用频率（组件一、二的加权依据）──
         usage_freq = None
+        usage_record = None
         if need_freq:
             try:
-                if hasattr(prompt, "get_expert_usage_freq"):
-                    usage_freq = prompt.get_expert_usage_freq().detach().cpu()
-                else:
-                    usage_freq = save_expert_usage_freqs(self.model, train_loader, device)
-                memory.expert_usage_freq = usage_freq
+                usage_freq, memory_usage_freq, usage_record = self._collect_expert_usage_info(
+                    prompt,
+                    train_loader,
+                    device,
+                )
+                memory.expert_usage_freq = memory_usage_freq
 
                 if self._diag_logger is not None:
                     self._diag_logger.log_expert_freqs(
@@ -794,11 +974,25 @@ class OnePrompt(Prompt):
                 print(f"[v3] Warning: Failed to save expert usage freqs: {e}")
 
         # 保存到 old_memories 列表
+        split_summary = None
         if self._split_lite_projector is not None:
             try:
                 split_summary = self._split_lite_projector.finalize_task(
                     task_id=self.task_count,
                     usage_freq=usage_freq,
+                    diagnostics={
+                        "expert_usage_mode": self._v1_config.get(
+                            "expert_usage_mode", "cumulative"
+                        ),
+                        "previous_selected_jaccard": usage_record.get(
+                            "previous_selected_jaccard"
+                        )
+                        if usage_record
+                        else None,
+                        "cp_overlap": usage_record.get("cp_overlap")
+                        if usage_record
+                        else None,
+                    },
                 )
                 print(
                     "[v4-split-lite] Task "
@@ -806,6 +1000,17 @@ class OnePrompt(Prompt):
                 )
             except Exception as e:
                 print(f"[v4-split-lite] Warning: Failed to update basis: {e}")
+
+        if usage_record is not None:
+            if split_summary is not None:
+                usage_record["protected_experts"] = split_summary.get("active_experts", [])
+                if usage_record.get("cp_scores") is not None:
+                    usage_record["cp_overlap"]["cp_top_active_vs_protected"] = self._jaccard(
+                        usage_record["cp_scores"].get("top_active", []),
+                        usage_record["protected_experts"],
+                    )
+            self._write_jsonl(self._usage_log_path(), usage_record)
+            self._log_transient_overlap(usage_record, split_summary)
 
         self.old_memories.append(memory)
         self._refresh_l2_anchors(prompt)

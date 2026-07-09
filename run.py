@@ -126,6 +126,17 @@ def create_args():
         help="project only the latest active top-k experts instead of all experts with historical bases",
     )
     parser.add_argument(
+        "--expert_usage_mode",
+        type=str,
+        default="cumulative",
+        choices=["cumulative", "task", "old_union"],
+        help=(
+            "expert-frequency source for v4/v5 protection: cumulative uses "
+            "SMoPE's historical counters, task recomputes usage on the current "
+            "task loader, old_union protects the union of old important experts"
+        ),
+    )
+    parser.add_argument(
         "--experiment_version",
         type=str,
         default="v4_split_lite",

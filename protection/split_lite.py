@@ -9,6 +9,7 @@ per-task full-gradient SVD used by earlier prototypes.
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -156,7 +157,12 @@ class SplitLiteProjector:
             alpha = alpha * self.expert_alpha_scale[expert_idx].to(device)
         return alpha.clamp_min(0.0)
 
-    def finalize_task(self, task_id: int, usage_freq: Optional[torch.Tensor] = None):
+    def finalize_task(
+        self,
+        task_id: int,
+        usage_freq: Optional[torch.Tensor] = None,
+        diagnostics: Optional[dict] = None,
+    ):
         """Build/merge low-rank bases from the current task gradient buffers."""
         active = self._active_experts(usage_freq)
         summary = {
@@ -170,9 +176,12 @@ class SplitLiteProjector:
             "active_topk": self.active_topk,
             "strict_current_topk": self.strict_current_topk,
             "active_experts": sorted(active),
+            "usage": self._usage_summary(usage_freq),
             "basis_sizes": {},
             "stats": dict(self.stats),
         }
+        if diagnostics:
+            summary["diagnostics"] = diagnostics
 
         for comp in self.components:
             comp_sizes = {}
@@ -216,6 +225,26 @@ class SplitLiteProjector:
         if not active and usage.numel() > 0:
             active.add(int(torch.argmax(usage).item()))
         return active
+
+    def _usage_summary(self, usage_freq: Optional[torch.Tensor]):
+        if usage_freq is None:
+            return None
+        usage = usage_freq.detach().cpu().float()
+        total = usage.sum().clamp_min(1e-12)
+        usage = usage / total
+        top_order = torch.argsort(usage, descending=True)
+        top3 = top_order[: min(3, usage.numel())]
+        top5 = top_order[: min(5, usage.numel())]
+        entropy = float(-(usage * (usage + 1e-12).log()).sum())
+        return {
+            "vector": usage.tolist(),
+            "top3": [int(x) for x in top3.tolist()],
+            "top5": [int(x) for x in top5.tolist()],
+            "top3_mass": float(usage[top3].sum()) if top3.numel() > 0 else 0.0,
+            "top5_mass": float(usage[top5].sum()) if top5.numel() > 0 else 0.0,
+            "entropy": entropy,
+            "max_entropy": float(math.log(max(int(usage.numel()), 1))),
+        }
 
     def _top_basis(self, matrix: torch.Tensor):
         if matrix.numel() == 0:

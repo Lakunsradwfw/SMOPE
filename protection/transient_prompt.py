@@ -161,6 +161,9 @@ class TransientPromptProbe:
         with open(self.log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    def write_record(self, record: dict):
+        self._write_json(record)
+
 
 def _get_prompt(model):
     module = model.module if hasattr(model, "module") else model

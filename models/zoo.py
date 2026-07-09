@@ -565,6 +565,8 @@ class OnePrompt(nn.Module):
             "split_lite_expert_threshold": 0.03,
             "split_lite_active_topk": None,
             "split_lite_strict_current_topk": False,
+            "expert_usage_mode": "cumulative",
+            "enable_usage_diagnostics": True,
             "split_lite_min_task": 1,
             "split_lite_basis_decay": 0.7,
             "use_transient_prompt": False,

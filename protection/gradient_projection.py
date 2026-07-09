@@ -235,8 +235,10 @@ def save_expert_usage_freqs(model, dataloader, device: str = "cuda") -> torch.Te
         expert_usage_freq: [K] 归一化的 expert 使用频率
     """
     model.eval()
+    module = model.module if hasattr(model, "module") else model
+    prompt = module.prompt
 
-    num_experts = model.prompt.num_experts
+    num_experts = prompt.num_experts
     usage_counts = torch.zeros(num_experts)
 
     with torch.no_grad():
@@ -247,7 +249,7 @@ def save_expert_usage_freqs(model, dataloader, device: str = "cuda") -> torch.Te
                 if score is not None:
                     _, top_indices = torch.topk(
                         score.mean(dim=1).squeeze(2),
-                        k=min(model.prompt.topk, score.size(-1)),
+                        k=min(prompt.topk, score.size(-1)),
                         dim=-1,
                     )
                     for idx in top_indices.view(-1).cpu():
