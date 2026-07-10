@@ -799,6 +799,209 @@ experiments/cifar-100_v5_exp3_transient_full.sh     # router bias + e_pv protect
 
 推荐先跑 `MAX_TASK=5, REPEAT=5`，若 `v5_exp3` 的 CAA/FAA 趋势明显优于 `v5_exp1`，再扩展到 `MAX_TASK=10` 和正式 `CRCT_EPOCHS=50`。
 
+2.11
+
+# Sensitivity Basis 验证优先级
+
+## Summary
+
+不需要一上来从 3 个方向全做。建议按证据强弱和实现成本分层：
+
+1. **先做旧类 prototype loss sensitivity basis**，这是最推荐的第一步。
+2. **再做旧任务 validation loss sensitivity basis**，作为更真实但更贵的确认。
+3. **function output drift 最大方向先不作为第一轮 basis**，更适合做辅助诊断。
+
+核心原因：你现在要验证的是“split-lite 当前 basis 是否对准旧任务会遗忘的方向”。最直接的办法不是多跑大实验，而是比较两个子空间是否重合：
+
+- 当前 split-lite basis：训练梯度 SVD 得到的方向。
+- sensitivity basis：旧任务 loss/function 对 `e_pv` 最敏感的方向。
+
+如果二者 overlap 很低，就说明 split-lite 投影的方向和真正需要保护的方向不是一回事。
+
+## 三种方向怎么理解
+
+**旧类 prototype loss 对 e_pv 的梯度：第一优先级**
+
+这是最适合先做的版本。
+
+机制是：每个旧类用一个 prototype 代表，例如旧类平均特征。然后计算当前模型在这些旧 prototype 上的 function/output drift 或 feature distill loss，再对 `e_pv` 反传，得到“旧类功能最怕变的方向”。
+
+优点：
+
+- 比 validation loss 快很多。
+- 和 repo 里已有的 `input_prototypes / pv_proto_outputs / compute_feature_distill_loss` 思路一致。
+- 很适合判断 split-lite basis 是否方向错。
+
+缺点：
+
+- prototype 是压缩代表，不等于完整旧任务数据。
+- 如果 prototype 保存得不准，sensitivity 也会偏。
+
+当前代码注意点：
+
+- 现在默认 `lambda_feat=0.0`，所以 prototype 数据不一定保存。
+- 需要加一个“只保存 prototype 用于诊断，但不启用 feature loss”的开关。
+
+**旧任务 validation loss 对 e_pv 的梯度：第二优先级**
+
+这是最真实的版本。
+
+机制是：拿旧任务 validation loader，计算旧任务 CE loss，对 `e_pv` 反传，得到旧任务 accuracy/loss 真正敏感的梯度方向。
+
+优点：
+
+- 和 “旧任务 accuracy 会掉” 最直接相关。
+- 证据最硬。
+
+缺点：
+
+- 成本高，需要保留或重新加载旧任务 validation 数据。
+- 每个旧任务、每个 expert 做梯度收集会慢。
+- 如果 batch 很少，方向会有噪声；如果 batch 多，运行时间会上去。
+
+所以它适合作为 prototype 版本之后的确认实验，而不是第一步。
+
+**function output drift 最大方向：辅助诊断，不建议第一轮作为主 basis**
+
+这个方向容易误解。
+“output drift 最大”本身是一个现象，不天然等于一个可投影 basis。你要把它变成 basis，仍然需要定义一个 loss，例如：
+
+```
+L_drift = || current_pv_output(old_proto) - saved_pv_output(old_proto) ||^2
+```
+
+然后对 `e_pv` 反传，这其实就回到了 prototype sensitivity basis。
+
+所以它更适合做辅助判断：
+
+- 如果某些旧类 prototype 的 function drift 很大，说明旧功能确实在漂。
+- 再看这些 drift 对应的 gradient basis 是否和 split-lite basis overlap 低。
+
+## 推荐实验顺序
+
+第一阶段只做 prototype sensitivity overlap，不跑完整训练：
+
+- 在任务结束时，对已有 split-lite basis `B_split` 做记录。
+- 对旧任务 prototype loss 反传，收集每个 expert 的 `e_pv` gradient。
+- 对这些 gradient 做 SVD 得到 `B_sens_proto`。
+- 计算每个 expert 的 overlap：
+
+```
+overlap = || B_split @ B_sens_proto.T ||_F^2 / rank
+```
+
+判断：
+
+- overlap 高，比如 >0.5：split-lite 方向大体对，问题可能是 alpha/rank/强度。
+- overlap 低，比如 <0.2：split-lite basis 没对准旧任务敏感方向，继续调 usage/topk/alpha 意义有限。
+- overlap 中间：需要看具体哪些 expert、哪些 task 低。
+
+第二阶段再做 alpha/rank 小矩阵：
+
+- `alpha=0 / 0.2 / 0.5`
+- `rank=4 / 8`
+- 固定 `active_topk=16`
+- 固定 `old_union + nonstrict`
+
+目标是验证：
+
+- 如果 overlap 高但性能不涨，可能是强度不够。
+- 如果 overlap 低且性能不涨，说明方向错。
+
+第三阶段才做 validation loss sensitivity basis：
+
+- 只挑 prototype overlap 最低、遗忘最严重的几个 task/expert。
+- 不需要全量旧任务全量 expert。
+- 用 validation loss 做确认，避免成本爆炸。
+
+## 是否能有效验证
+
+可以，但要注意它验证的是“机制假设”，不是直接证明最终 FAA 会涨。
+
+它能回答：
+
+- 当前 split-lite 投影方向和旧任务敏感方向是否一致？
+- 如果不一致，为什么 usage mode 更集中也没用？
+- 如果一致但性能不涨，是不是 alpha/rank 太弱？
+
+它不能单独回答：
+
+- 最终能不能稳定 +1 FAA。
+- 新 sensitivity basis 加进训练后一定有效。
+
+所以它是一个很好的“方向诊断实验”，不是最终性能实验。
+
+## 建议结论
+
+不要三个方向一起做。第一轮只做：
+
+**旧类 prototype loss sensitivity basis vs current split-lite basis overlap**
+
+这是最便宜、最贴近现有代码、最能回答当前问题的实验。
+
+如果 overlap 很低，就基本坐实：当前 split-lite 的主要问题是 basis 方向错。
+如果 overlap 不低，再去跑 `alpha/rank`，看是不是强度不够。
+如果 prototype 结果不确定，再用旧任务 validation loss 做小规模确认。
+
+---
+
+### 2.12 v6 双环实现与分卡实验（2026-07-10）
+
+v6 固定已验证的 `old_union top-16` 容量先验，并通过
+`projection_scope=protected_only` 让它真正限定被保护 expert；`e_pk`、anchor、
+replay 与分类器均不改动。
+
+- **方向敏感保护（主机制）**：任务结束后，对历史 prototype 的 `e_pv` 输出构建
+  top-16、rank-4 的功能 tangent basis。训练中仅对这 16 个 expert 投影；实时
+  `conflict_e=||B_e g_e||^2 / ||g_e||^2` 决定增量保护，
+  `alpha_e=0.2+0.3*(0.6*conflict_e+0.4*transient_risk_e)`，故基础保护不会被
+  transient 降低。
+- **瞬态 prompt（辅机制）**：仅 warm-up `e_pv` 20 batch，恢复权重前记录
+  `Delta e`；用 2 个不更新 batch 计算新任务 signed gain，并以
+  `||B_e Delta e||^2 / ||Delta e||^2` 计算旧功能风险。其兼容性只生成有界
+  `0.1 * centered(cp)` router bias，并只贡献上式 40% 的增量保护。
+- **可审计性**：`*_effective.log` 记录最终指标；`*_projection.log` 记录 basis
+  覆盖率与逐 expert 的 conflict/alpha/risk；`*_transient.log` 记录 gain/risk/cp/
+  router bias/delta norm。probe 会恢复参数、buffer、梯度、router 状态和 RNG。
+
+不提供一键总控或自动筛选脚本；以下五个脚本相互独立，可按显卡分别启动。默认均为
+`MAX_TASK=5 REPEAT=3 CRCT_EPOCHS=20 top-16 rank-4`，且各自写入不同目录：
+
+```text
+experiments/cifar-100_v6_exp1_legacy_topk16.sh       # GPU 0：gradient basis 对照
+experiments/cifar-100_v6_exp2_functional_topk16.sh   # GPU 1：功能 basis，固定 alpha=0.2
+experiments/cifar-100_v6_exp3_conflict_topk16.sh     # GPU 2：功能 basis + conflict 自适应
+experiments/cifar-100_v6_exp4_transient_topk16.sh    # GPU 3：conflict + transient router bias
+experiments/cifar-100_v6_exp5_dual_topk16.sh         # GPU 4：完整双环
+```
+
+例如四张卡并行时：
+
+```bash
+GPUID=0 bash experiments/cifar-100_v6_exp1_legacy_topk16.sh
+GPUID=1 bash experiments/cifar-100_v6_exp2_functional_topk16.sh
+GPUID=2 bash experiments/cifar-100_v6_exp3_conflict_topk16.sh
+GPUID=3 bash experiments/cifar-100_v6_exp4_transient_topk16.sh
+GPUID=4 bash experiments/cifar-100_v6_exp5_dual_topk16.sh
+```
+
+只有一至四张卡时，只需把命令最前的 `GPUID` 改成空闲卡号（例如把 Exp5 的
+`GPUID=4` 改为 `GPUID=0`）；需要新一轮参数试验时，改用新的
+`OUTDIR`，避免覆盖或混合旧日志。例如正式候选可运行：
+
+```bash
+GPUID=0 MAX_TASK=10 REPEAT=5 OUTDIR=outputs/cifar-100/10-task/v6-final-dual \
+  bash experiments/cifar-100_v6_exp5_dual_topk16.sh
+```
+
+手工比对遵循严格配对：先确认各目录 `args.yaml` 的 `MAX_TASK`、`CRCT_EPOCHS`、
+seed 与 `repeat` 相同，再直接对比 `effective.log` 中每个 repeat 的 FAA/CAA/FR。
+比较链为 Exp1→Exp2（功能方向是否有效）、Exp2→Exp3（conflict 是否有增益）、
+Exp3→Exp4（在 conflict 上加入 transient router 是否有益）、Exp3→Exp5（双环是否协同）。先看 Exp2
+的 projection 覆盖率中位数是否不少于 0.20；满足后，只有 FAA 或 CAA 比匹配对照
+提高至少 0.5 且 FR 不变差，才升级该候选至 10-task、5 seeds。不得把缺失的
+repeat 或不同预算的目录混入比较。
+
 ---
 
 ## 3. 统一设计原则：Activation-Weighted Stability-Plasticity Trade-off

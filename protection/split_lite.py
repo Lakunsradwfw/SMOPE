@@ -27,6 +27,12 @@ class SplitLiteProjector:
         expert_threshold: float = 0.03,
         active_topk: Optional[int] = None,
         strict_current_topk: bool = False,
+        basis_source: str = "gradient",
+        projection_scope: str = "all_with_basis",
+        adaptive_conflict: bool = False,
+        use_transient_risk: bool = False,
+        adaptive_alpha_max: float = 0.5,
+        conflict_weight: float = 0.6,
         components: Iterable[str] = ("e_pv",),
         min_task: int = 1,
         basis_decay: float = 0.7,
@@ -39,6 +45,16 @@ class SplitLiteProjector:
         self.expert_threshold = float(expert_threshold)
         self.active_topk = None if active_topk is None else max(int(active_topk), 1)
         self.strict_current_topk = bool(strict_current_topk)
+        if basis_source not in {"gradient", "functional_tangent"}:
+            raise ValueError(f"unknown split-lite basis source: {basis_source}")
+        if projection_scope not in {"all_with_basis", "protected_only"}:
+            raise ValueError(f"unknown split-lite projection scope: {projection_scope}")
+        self.basis_source = basis_source
+        self.projection_scope = projection_scope
+        self.adaptive_conflict = bool(adaptive_conflict)
+        self.use_transient_risk = bool(use_transient_risk)
+        self.adaptive_alpha_max = max(float(adaptive_alpha_max), self.alpha)
+        self.conflict_weight = min(max(float(conflict_weight), 0.0), 1.0)
         self.components = tuple(components)
         self.min_task = int(min_task)
         self.basis_decay = float(basis_decay)
@@ -58,6 +74,7 @@ class SplitLiteProjector:
             "skipped_steps": 0,
         }
         self.expert_alpha_scale = None
+        self.transient_risk = None
 
     @classmethod
     def from_config(cls, config: dict, log_path: Optional[str] = None):
@@ -75,6 +92,12 @@ class SplitLiteProjector:
             expert_threshold=config.get("split_lite_expert_threshold", 0.03),
             active_topk=config.get("split_lite_active_topk"),
             strict_current_topk=config.get("split_lite_strict_current_topk", False),
+            basis_source=config.get("split_lite_basis_source", "gradient"),
+            projection_scope=config.get("split_lite_projection_scope", "all_with_basis"),
+            adaptive_conflict=config.get("split_lite_adaptive_conflict", False),
+            use_transient_risk=config.get("split_lite_use_transient_risk", False),
+            adaptive_alpha_max=config.get("split_lite_adaptive_alpha_max", 0.5),
+            conflict_weight=config.get("split_lite_conflict_weight", 0.6),
             components=components,
             min_task=config.get("split_lite_min_task", 1),
             basis_decay=config.get("split_lite_basis_decay", 0.7),
@@ -82,7 +105,7 @@ class SplitLiteProjector:
         )
 
     def step(self, prompt, task_id: int, batch_idx: int):
-        """Project old-basis directions and collect a current gradient sample."""
+        """Project old-basis directions and optionally collect gradient bases."""
         if batch_idx % self.interval != 0:
             self.stats["skipped_steps"] += 1
             return None
@@ -94,12 +117,19 @@ class SplitLiteProjector:
             "projected": 0,
             "collected": 0,
             "mean_removed_ratio": 0.0,
+            "mean_conflict": 0.0,
+            "mean_alpha": 0.0,
+            "basis_source": self.basis_source,
+            "projection_scope": self.projection_scope,
+            "experts": {},
             "strict_current_topk": self.strict_current_topk,
             "project_active_experts": sorted(self.current_active_experts)
             if self.current_active_experts is not None
             else None,
         }
         removed_ratios = []
+        conflicts = []
+        alphas = []
 
         for comp in self.components:
             for expert_idx in range(getattr(prompt, "num_experts", 0)):
@@ -115,7 +145,7 @@ class SplitLiteProjector:
                 )
                 if (
                     should_project
-                    and self.strict_current_topk
+                    and self._uses_protected_scope()
                     and self.current_active_experts is not None
                     and expert_idx not in self.current_active_experts
                 ):
@@ -124,18 +154,37 @@ class SplitLiteProjector:
                 if should_project:
                     basis = basis.to(grad_vec.device, dtype=grad_vec.dtype)
                     projection = basis.t().matmul(basis.matmul(grad_vec))
-                    alpha = self._alpha_for_expert(expert_idx, grad_vec.device)
+                    denom_sq = grad_vec.pow(2).sum().clamp_min(1e-12)
+                    conflict = float((projection.pow(2).sum() / denom_sq).clamp(0.0, 1.0))
+                    alpha = self._alpha_for_expert(
+                        expert_idx,
+                        grad_vec.device,
+                        conflict=conflict,
+                    )
                     projected_grad = grad_vec - alpha * projection
                     self._write_expert_grad(projected_grad, slices)
                     denom = grad_vec.norm().clamp_min(1e-12)
-                    removed_ratios.append(float((alpha * projection).norm() / denom))
+                    removed_ratio = float((alpha * projection).norm() / denom)
+                    transient_risk = self._risk_for_expert(expert_idx)
+                    removed_ratios.append(removed_ratio)
+                    conflicts.append(conflict)
+                    alphas.append(float(alpha))
+                    summary["experts"][str(expert_idx)] = {
+                        "conflict": conflict,
+                        "alpha": float(alpha),
+                        "transient_risk": transient_risk,
+                        "removed_ratio": removed_ratio,
+                    }
                     summary["projected"] += 1
 
-                self._append_buffer(comp, expert_idx, grad_vec.detach().cpu())
-                summary["collected"] += 1
+                if self.basis_source == "gradient":
+                    self._append_buffer(comp, expert_idx, grad_vec.detach().cpu())
+                    summary["collected"] += 1
 
         if removed_ratios:
             summary["mean_removed_ratio"] = sum(removed_ratios) / len(removed_ratios)
+            summary["mean_conflict"] = sum(conflicts) / len(conflicts)
+            summary["mean_alpha"] = sum(alphas) / len(alphas)
 
         self.stats["project_calls"] += 1
         self.stats["projected_vectors"] += summary["projected"]
@@ -149,13 +198,94 @@ class SplitLiteProjector:
         else:
             self.expert_alpha_scale = scale.detach().cpu().float()
 
-    def _alpha_for_expert(self, expert_idx: int, device):
+    def set_transient_risk(self, risk: Optional[torch.Tensor]):
+        """Install task-local old-function risk for functional tangent v6."""
+        self.transient_risk = None if risk is None else risk.detach().cpu().float()
+
+    def get_component_bases(self, component: str = "e_pv") -> Dict[int, torch.Tensor]:
+        return dict(self.bases.get(component, {}))
+
+    def select_active_experts(self, usage_freq: Optional[torch.Tensor]):
+        return self._active_experts(usage_freq)
+
+    def install_functional_bases(
+        self,
+        task_id: int,
+        bases: Dict[int, torch.Tensor],
+        active_experts: Iterable[int],
+        diagnostics: Optional[dict] = None,
+    ):
+        """Replace gradient-derived bases with task-final functional tangent bases.
+
+        A prototype capture can occasionally fail.  In that case a v6 run
+        must retain the previous valid protection set instead of silently
+        dropping all old-task protection for the next task.
+        """
+        active = {int(idx) for idx in active_experts}
+        self.bases.setdefault("e_pv", {})
+        installed = {
+            int(idx): basis.detach().cpu()
+            for idx, basis in bases.items()
+            if int(idx) in active and basis.numel() > 0
+        }
+        kept_previous = False
+        if not installed and self.bases["e_pv"]:
+            kept_previous = True
+            active = set(self.current_active_experts or self.bases["e_pv"].keys())
+        else:
+            self.bases["e_pv"] = installed
+        for comp in self.components:
+            if comp != "e_pv" and not kept_previous:
+                self.bases[comp] = {}
+            self.buffers[comp].clear()
+        if not kept_previous:
+            self.current_active_experts = active
+        summary = {
+            "event": "split_lite_functional_task_finish",
+            "task_id": int(task_id),
+            "basis_source": self.basis_source,
+            "projection_scope": self.projection_scope,
+            "rank": int(self.rank),
+            "alpha": float(self.alpha),
+            "adaptive_alpha_max": float(self.adaptive_alpha_max),
+            "active_topk": self.active_topk,
+            "active_experts": sorted(active),
+            "kept_previous_bases": kept_previous,
+            "basis_sizes": {
+                "e_pv": {
+                    str(idx): int(basis.shape[0])
+                    for idx, basis in self.bases["e_pv"].items()
+                }
+            },
+            "stats": dict(self.stats),
+        }
+        if diagnostics:
+            summary["diagnostics"] = diagnostics
+        self._write_json(summary)
+        return summary
+
+    def _alpha_for_expert(self, expert_idx: int, device, conflict: float = 0.0):
         alpha = torch.tensor(float(self.alpha), device=device)
+        if self.basis_source == "functional_tangent" and self.adaptive_conflict:
+            risk = self._risk_for_expert(expert_idx) if self.use_transient_risk else 0.0
+            blend = self.conflict_weight * float(conflict) + (1.0 - self.conflict_weight) * risk
+            return torch.tensor(
+                float(self.alpha) + (self.adaptive_alpha_max - self.alpha) * blend,
+                device=device,
+            )
         if self.expert_alpha_scale is None:
             return alpha
         if expert_idx < len(self.expert_alpha_scale):
             alpha = alpha * self.expert_alpha_scale[expert_idx].to(device)
         return alpha.clamp_min(0.0)
+
+    def _risk_for_expert(self, expert_idx: int) -> float:
+        if self.transient_risk is None or expert_idx >= len(self.transient_risk):
+            return 0.0
+        return float(self.transient_risk[expert_idx].clamp(0.0, 1.0))
+
+    def _uses_protected_scope(self):
+        return self.projection_scope == "protected_only" or self.strict_current_topk
 
     def finalize_task(
         self,
@@ -163,7 +293,11 @@ class SplitLiteProjector:
         usage_freq: Optional[torch.Tensor] = None,
         diagnostics: Optional[dict] = None,
     ):
-        """Build/merge low-rank bases from the current task gradient buffers."""
+        """Build/merge low-rank bases from current gradients (legacy path)."""
+        if self.basis_source != "gradient":
+            raise RuntimeError(
+                "functional_tangent bases must be installed with install_functional_bases"
+            )
         active = self._active_experts(usage_freq)
         summary = {
             "event": "split_lite_task_finish",

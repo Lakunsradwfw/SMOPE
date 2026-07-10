@@ -132,9 +132,55 @@ def create_args():
         help="project only the latest active top-k experts instead of all experts with historical bases",
     )
     parser.add_argument(
+        "--split_lite_basis_source",
+        choices=["gradient", "functional_tangent"],
+        default=None,
+        help="basis source: legacy training gradients or v6 prototype-output tangents",
+    )
+    parser.add_argument(
+        "--split_lite_projection_scope",
+        choices=["all_with_basis", "protected_only"],
+        default=None,
+        help="whether projection applies to all stored bases or only the active protected set",
+    )
+    parser.add_argument(
+        "--split_lite_adaptive_conflict",
+        action="store_true",
+        help="adapt functional-tangent projection strength from live gradient conflict",
+    )
+    parser.add_argument(
+        "--split_lite_use_transient_risk",
+        action="store_true",
+        help="add v6 transient old-function risk to adaptive projection strength",
+    )
+    parser.add_argument(
+        "--split_lite_adaptive_alpha_max",
+        type=float,
+        default=None,
+        help="maximum per-expert alpha for v6 adaptive conflict projection",
+    )
+    parser.add_argument(
+        "--split_lite_conflict_weight",
+        type=float,
+        default=None,
+        help="weight of live conflict versus transient risk in v6 adaptive alpha",
+    )
+    parser.add_argument(
+        "--functional_tangent_max_memories",
+        type=int,
+        default=None,
+        help="prototype memories used for v6 tangent bases; 0 keeps all tasks",
+    )
+    parser.add_argument(
+        "--functional_tangent_seed",
+        type=int,
+        default=None,
+        help="deterministic Rademacher VJP seed for v6 tangent bases",
+    )
+    parser.add_argument(
         "--expert_usage_mode",
         type=str,
-        default="cumulative",
+        default=None,
         choices=["cumulative", "task", "old_union"],
         help=(
             "expert-frequency source for v4/v5 protection: cumulative uses "
@@ -199,6 +245,18 @@ def create_args():
         type=float,
         default=None,
         help="expert-wise e_pv anchor/projection scaling strength",
+    )
+    parser.add_argument(
+        "--transient_mode",
+        choices=["legacy_importance", "risk_reward"],
+        default=None,
+        help="legacy gradient-importance probe or v6 gain-minus-risk compatibility probe",
+    )
+    parser.add_argument(
+        "--transient_eval_batches",
+        type=int,
+        default=None,
+        help="number of no-update probe batches used to measure transient expert gain",
     )
 
     # new add Args

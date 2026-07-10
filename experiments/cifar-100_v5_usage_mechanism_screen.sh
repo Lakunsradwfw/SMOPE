@@ -6,6 +6,8 @@
 #
 # Override from the shell when needed, for example:
 #   MAX_TASK=5 REPEAT=5 ACTIVE_TOPK=16 bash experiments/cifar-100_v5_usage_mechanism_screen.sh
+#   USAGE_MODES="task old_union" bash experiments/cifar-100_v5_usage_mechanism_screen.sh
+#   STRICT_MODES="0" bash experiments/cifar-100_v5_usage_mechanism_screen.sh
 
 DATASET=${DATASET:-cifar-100}
 OUTDIR=${OUTDIR:-outputs/${DATASET}/10-task}
@@ -18,11 +20,13 @@ CRCT_EPOCHS=${CRCT_EPOCHS:-50}
 ACTIVE_TOPK=${ACTIVE_TOPK:-16}
 SPLIT_ALPHA=${SPLIT_ALPHA:-0.2}
 SPLIT_MIN_TASK=${SPLIT_MIN_TASK:-1}
+USAGE_MODES=${USAGE_MODES:-"cumulative task old_union"}
+STRICT_MODES=${STRICT_MODES:-"0 1"}
 
 mkdir -p "${OUTDIR}"
 
-for USAGE_MODE in cumulative task old_union; do
-  for STRICT_CURRENT in 0 1; do
+for USAGE_MODE in ${USAGE_MODES}; do
+  for STRICT_CURRENT in ${STRICT_MODES}; do
     STRICT_LABEL=nonstrict
     STRICT_ARG=
     if [ "${STRICT_CURRENT}" = "1" ]; then

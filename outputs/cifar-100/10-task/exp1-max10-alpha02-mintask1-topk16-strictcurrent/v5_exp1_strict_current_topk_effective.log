@@ -1,0 +1,3 @@
+# SMoPE v5_exp1_strict_current_topk effective data log
+# Main accuracy output is kept in v5_exp1_strict_current_topk_output.log.
+# Each JSON line is self-contained for later analysis.

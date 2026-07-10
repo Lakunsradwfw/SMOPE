@@ -49,7 +49,10 @@ from protection.loss_logger import (
 )
 from protection.split_lite import SplitLiteProjector
 from protection.transient_prompt import TransientPromptProbe
-from protection.sensitivity_basis import compute_prototype_sensitivity_overlap
+from protection.sensitivity_basis import (
+    build_functional_tangent_bases,
+    compute_prototype_sensitivity_overlap,
+)
 
 
 class Prompt(NormalNN):
@@ -205,6 +208,7 @@ class OnePrompt(Prompt):
         self._split_lite_projector = None
         self._transient_probe = None
         self._transient_cp_scores = None
+        self._transient_risk_scores = None
         self._last_usage_top_active = None
         # ── v3: no incremental subspace estimator needed ──
 
@@ -226,6 +230,20 @@ class OnePrompt(Prompt):
                 self._v1_config["split_lite_active_topk"] = int(self.config["split_lite_active_topk"])
             if self.config.get("split_lite_strict_current_topk"):
                 self._v1_config["split_lite_strict_current_topk"] = True
+            if self.config.get("split_lite_adaptive_conflict"):
+                self._v1_config["split_lite_adaptive_conflict"] = True
+            if self.config.get("split_lite_use_transient_risk"):
+                self._v1_config["split_lite_use_transient_risk"] = True
+            for cfg_key in (
+                "split_lite_basis_source",
+                "split_lite_projection_scope",
+                "split_lite_adaptive_alpha_max",
+                "split_lite_conflict_weight",
+                "functional_tangent_max_memories",
+                "functional_tangent_seed",
+            ):
+                if self.config.get(cfg_key) is not None:
+                    self._v1_config[cfg_key] = self.config[cfg_key]
             if self.config.get("expert_usage_mode") is not None:
                 self._v1_config["expert_usage_mode"] = self.config["expert_usage_mode"]
             if self.config.get("enable_sensitivity_diagnostics"):
@@ -243,9 +261,22 @@ class OnePrompt(Prompt):
                 "transient_min_task",
                 "transient_cp_bias_weight",
                 "transient_protect_scale",
+                "transient_mode",
+                "transient_eval_batches",
             ):
                 if self.config.get(cfg_key) is not None:
                     self._v1_config[cfg_key] = self.config[cfg_key]
+
+            # V6 has a deliberate capacity prior: old-task union top-16 is
+            # the protected pool and that pool must actually bound projection.
+            # Explicit CLI values still win for ablations.
+            if self._v1_config.get("split_lite_basis_source") == "functional_tangent":
+                if self.config.get("split_lite_active_topk") is None:
+                    self._v1_config["split_lite_active_topk"] = 16
+                if self.config.get("split_lite_projection_scope") is None:
+                    self._v1_config["split_lite_projection_scope"] = "protected_only"
+                if self.config.get("expert_usage_mode") is None:
+                    self._v1_config["expert_usage_mode"] = "old_union"
         except Exception:
             self._v1_config = {
                 "lambda_pk": 0.0,
@@ -306,7 +337,13 @@ class OnePrompt(Prompt):
         if not self._transient_probe.should_run(self.task_count):
             return
         prompt = self.model.module.prompt if hasattr(self.model, 'module') else self.model.prompt
-        scores, record = self._transient_probe.run(
+        functional_bases = None
+        if (
+            self._split_lite_projector is not None
+            and self._v1_config.get("split_lite_basis_source") == "functional_tangent"
+        ):
+            functional_bases = self._split_lite_projector.get_component_bases("e_pv")
+        scores, risks, record = self._transient_probe.run(
             self.model,
             train_loader,
             self.criterion,
@@ -316,21 +353,33 @@ class OnePrompt(Prompt):
             dw_k=self.dw_k,
             cls_mean=self.cls_mean,
             gpu=self.gpu,
+            functional_bases=functional_bases,
+            router_bias_weight=self._v1_config.get("transient_cp_bias_weight", 0.0),
         )
         self._transient_cp_scores = scores.detach().cpu()
+        self._transient_risk_scores = risks.detach().cpu()
         prompt.set_transient_cp_scores(
             self._transient_cp_scores,
             bias_weight=self._v1_config.get("transient_cp_bias_weight", 0.0),
             protect_scale=self._v1_config.get("transient_protect_scale", 0.0),
+            router_compatibility=record.get("compatibility_logits")
+            if record.get("mode") == "risk_reward"
+            else None,
         )
         if self._split_lite_projector is not None:
-            self._split_lite_projector.set_expert_alpha_scale(
-                prompt.get_transient_protection_scale()
-            )
+            if self._v1_config.get("split_lite_basis_source") == "functional_tangent":
+                self._split_lite_projector.set_transient_risk(
+                    self._transient_risk_scores
+                )
+            else:
+                self._split_lite_projector.set_expert_alpha_scale(
+                    prompt.get_transient_protection_scale()
+                )
         print(
-            "[v5-transient] Task "
+            "[transient] Task "
             f"{self.task_count} probe ready: steps={record.get('steps', 0)}, "
-            f"max_cp={float(self._transient_cp_scores.max()):.4f}"
+            f"max_cp={float(self._transient_cp_scores.max()):.4f}, "
+            f"max_risk={float(self._transient_risk_scores.max()):.4f}"
         )
 
     def _usage_log_path(self):
@@ -522,6 +571,7 @@ class OnePrompt(Prompt):
         protected = split_summary.get("active_experts", []) if split_summary else []
         selected = usage_record.get("selected_usage") or {}
         cp_stats = usage_record.get("cp_scores") or {}
+        risk_scores = self._transient_risk_scores
         record = {
             "event": "transient_overlap",
             "task_id": int(self.task_count),
@@ -529,6 +579,7 @@ class OnePrompt(Prompt):
             "active_topk": usage_record.get("active_topk"),
             "route_topk": usage_record.get("route_topk"),
             "cp_top_active": cp_stats.get("top_active", []),
+            "transient_risk": risk_scores.tolist() if risk_scores is not None else [],
             "task_top_active": (usage_record.get("task_usage") or {}).get("top_active", []),
             "selected_top_active": selected.get("top_active", []),
             "protected_experts": protected,
@@ -960,6 +1011,8 @@ class OnePrompt(Prompt):
         )
         if self._transient_cp_scores is not None:
             memory.transient_cp_scores = self._transient_cp_scores.detach().cpu().clone()
+        if self._transient_risk_scores is not None:
+            memory.transient_risk_scores = self._transient_risk_scores.detach().cpu().clone()
 
         # ── v3 组件一：保存 e_pk 权重快照 ──
         if v1.get("lambda_pk", 0.0) > 0:
@@ -981,6 +1034,7 @@ class OnePrompt(Prompt):
         need_feat = (
             v1.get("lambda_feat", 0.0) > 0
             or v1.get("enable_sensitivity_diagnostics", False)
+            or v1.get("split_lite_basis_source") == "functional_tangent"
         )
         need_freq = (
             v1.get("lambda_pk", 0.0) > 0
@@ -1032,7 +1086,10 @@ class OnePrompt(Prompt):
         pre_active_experts = None
         if (
             self._split_lite_projector is not None
-            and self._split_lite_projector.strict_current_topk
+            and (
+                self._split_lite_projector.strict_current_topk
+                or self._split_lite_projector.projection_scope == "protected_only"
+            )
         ):
             pre_active_experts = self._split_lite_projector.current_active_experts
         self._log_sensitivity_overlap(
@@ -1041,7 +1098,10 @@ class OnePrompt(Prompt):
             "pre_finalize",
             pre_active_experts,
         )
-        if self._split_lite_projector is not None:
+        if (
+            self._split_lite_projector is not None
+            and self._split_lite_projector.basis_source == "gradient"
+        ):
             try:
                 split_summary = self._split_lite_projector.finalize_task(
                     task_id=self.task_count,
@@ -1067,6 +1127,47 @@ class OnePrompt(Prompt):
             except Exception as e:
                 print(f"[v4-split-lite] Warning: Failed to update basis: {e}")
 
+        # Include the just-finished task before constructing functional
+        # tangent bases so task t is protected starting at task t+1.
+        self.old_memories.append(memory)
+
+        if (
+            self._split_lite_projector is not None
+            and self._split_lite_projector.basis_source == "functional_tangent"
+        ):
+            try:
+                active_experts = self._split_lite_projector.select_active_experts(
+                    usage_freq
+                )
+                bases, tangent_record = build_functional_tangent_bases(
+                    prompt,
+                    self.old_memories,
+                    rank=self._split_lite_projector.rank,
+                    active_experts=active_experts,
+                    max_memories=v1.get("functional_tangent_max_memories", 0),
+                    seed=v1.get("functional_tangent_seed", 1729),
+                    device=device,
+                )
+                split_summary = self._split_lite_projector.install_functional_bases(
+                    task_id=self.task_count,
+                    bases=bases,
+                    active_experts=active_experts,
+                    diagnostics={
+                        "expert_usage_mode": v1.get("expert_usage_mode", "cumulative"),
+                        "previous_selected_jaccard": usage_record.get(
+                            "previous_selected_jaccard"
+                        ) if usage_record else None,
+                        "tangent": tangent_record,
+                    },
+                )
+                print(
+                    "[v6-functional] Task "
+                    f"{self.task_count} basis updated: "
+                    f"{split_summary['basis_sizes']}"
+                )
+            except Exception as e:
+                print(f"[v6-functional] Warning: Failed to update basis: {e}")
+
         if usage_record is not None:
             if split_summary is not None:
                 usage_record["protected_experts"] = split_summary.get("active_experts", [])
@@ -1081,7 +1182,10 @@ class OnePrompt(Prompt):
         post_active_experts = None
         if (
             self._split_lite_projector is not None
-            and self._split_lite_projector.strict_current_topk
+            and (
+                self._split_lite_projector.strict_current_topk
+                or self._split_lite_projector.projection_scope == "protected_only"
+            )
         ):
             post_active_experts = split_summary.get("active_experts", []) if split_summary else []
         self._log_sensitivity_overlap(
@@ -1091,7 +1195,6 @@ class OnePrompt(Prompt):
             post_active_experts,
         )
 
-        self.old_memories.append(memory)
         self._refresh_l2_anchors(prompt)
         print(f"[v3] Task {self.task_count} memory saved. "
               f"Total old memories: {len(self.old_memories)}")

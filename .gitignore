@@ -1,13 +1,14 @@
 # repo-specific stuff
 .cursor/
+.codex/
+.agents/
+.tools/
 .trellis/
 AGENTS.md
 continual_papers_feasibility_part3.md
 data/
 data
-outputs
 pretrained
-outputs/
 pretrained/
 *.pt
 \#*#
@@ -20,7 +21,6 @@ pretrained/
 .swp
 */*@
 .vscode/
-*.log
 *.xlsx
 
 # Byte-compiled / optimized / DLL files
@@ -51,8 +51,8 @@ wheels/
 *.egg
 
 # PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+# Usually these files are written by a python script from a template
+# before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
 
@@ -76,7 +76,6 @@ coverage.xml
 *.pot
 
 # Django stuff:
-*.log
 local_settings.py
 
 # Flask stuff:
@@ -124,16 +123,3 @@ ENV/
 
 # mypy
 .mypy_cache/
-© 2023 GitHub, Inc.
-Terms
-Privacy
-Security
-Status
-Docs
-Contact GitHub
-Pricing
-API
-Training
-Blog
-About
-Loading complete

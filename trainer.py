@@ -163,6 +163,14 @@ class Trainer:
             "split_lite_min_task": args.split_lite_min_task,
             "split_lite_active_topk": args.split_lite_active_topk,
             "split_lite_strict_current_topk": args.split_lite_strict_current_topk,
+            "split_lite_basis_source": args.split_lite_basis_source,
+            "split_lite_projection_scope": args.split_lite_projection_scope,
+            "split_lite_adaptive_conflict": args.split_lite_adaptive_conflict,
+            "split_lite_use_transient_risk": args.split_lite_use_transient_risk,
+            "split_lite_adaptive_alpha_max": args.split_lite_adaptive_alpha_max,
+            "split_lite_conflict_weight": args.split_lite_conflict_weight,
+            "functional_tangent_max_memories": args.functional_tangent_max_memories,
+            "functional_tangent_seed": args.functional_tangent_seed,
             "expert_usage_mode": args.expert_usage_mode,
             "enable_sensitivity_diagnostics": args.enable_sensitivity_diagnostics,
             "sensitivity_rank": args.sensitivity_rank,
@@ -174,6 +182,8 @@ class Trainer:
             "transient_min_task": args.transient_min_task,
             "transient_cp_bias_weight": args.transient_cp_bias_weight,
             "transient_protect_scale": args.transient_protect_scale,
+            "transient_mode": args.transient_mode,
+            "transient_eval_batches": args.transient_eval_batches,
             "log_dir": args.log_dir,
         }
         self.learner_type, self.learner_name = args.learner_type, args.learner_name

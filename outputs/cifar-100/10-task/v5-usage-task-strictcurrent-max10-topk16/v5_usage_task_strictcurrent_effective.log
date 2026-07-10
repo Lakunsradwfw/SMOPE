@@ -1,0 +1,3 @@
+# SMoPE v5_usage_task_strictcurrent effective data log
+# Main accuracy output is kept in v5_usage_task_strictcurrent_output.log.
+# Each JSON line is self-contained for later analysis.

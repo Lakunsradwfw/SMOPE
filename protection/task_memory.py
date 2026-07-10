@@ -44,6 +44,8 @@ class TaskMemory:
         self.expert_usage_freq: Optional[torch.Tensor] = None
         # v5: task-local transient prompt compatibility scores: [num_experts]
         self.transient_cp_scores: Optional[torch.Tensor] = None
+        # v6: task-local projected old-function risk of transient updates.
+        self.transient_risk_scores: Optional[torch.Tensor] = None
 
         # ── v3 组件三：特征蒸馏 ──
         # per-class e_pv 输出特征: [num_classes, d_pv]
@@ -72,7 +74,7 @@ class TaskMemory:
         """将所有 tensor 移到指定设备"""
         for attr in [
             "expert_usage_freq", "input_prototypes", "pv_proto_outputs",
-            "transient_cp_scores",
+            "transient_cp_scores", "transient_risk_scores",
             "router_prototypes", "router_pairwise_sim",
             "key_prototypes", "key_pairwise_sim",
         ]:
@@ -84,7 +86,7 @@ class TaskMemory:
         """将所有 tensor 移到 CPU"""
         for attr in [
             "expert_usage_freq", "input_prototypes", "pv_proto_outputs",
-            "transient_cp_scores",
+            "transient_cp_scores", "transient_risk_scores",
             "router_prototypes", "router_pairwise_sim",
             "key_prototypes", "key_pairwise_sim",
         ]:
@@ -101,7 +103,7 @@ class TaskMemory:
         }
         for attr in [
             "expert_usage_freq", "input_prototypes", "pv_proto_outputs",
-            "transient_cp_scores",
+            "transient_cp_scores", "transient_risk_scores",
             "router_prototypes", "router_pairwise_sim",
             "key_prototypes", "key_pairwise_sim",
         ]:
@@ -120,7 +122,7 @@ class TaskMemory:
         )
         for attr in [
             "expert_usage_freq", "input_prototypes", "pv_proto_outputs",
-            "transient_cp_scores",
+            "transient_cp_scores", "transient_risk_scores",
             "router_prototypes", "router_pairwise_sim",
             "key_prototypes", "key_pairwise_sim",
         ]:

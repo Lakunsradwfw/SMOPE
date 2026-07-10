@@ -60,8 +60,14 @@ class OnePrompt(nn.Module):
             "transient_cp_scores",
             torch.ones(self.num_experts, dtype=torch.float32) / self.num_experts,
         )
+        self.register_buffer(
+            "transient_cp_compatibility",
+            torch.zeros(self.num_experts, dtype=torch.float32),
+            persistent=False,
+        )
         self.transient_cp_bias_weight = 0.0
         self.transient_protect_scale = 0.0
+        self.transient_use_raw_compatibility = False
 
     def process_task_count(self):
         self.task_count += 1
@@ -202,8 +208,15 @@ class OnePrompt(nn.Module):
         scores,
         bias_weight: float = 0.0,
         protect_scale: float = 0.0,
+        router_compatibility=None,
     ):
-        """Install task-local transient compatibility scores for v5."""
+        """Install task-local transient scores.
+
+        Legacy v5 callers provide only a probability-like score.  V6 also
+        supplies centered raw compatibility logits, which keep the router
+        perturbation bounded rather than multiplying a peaked softmax by the
+        number of experts.
+        """
         if scores is None:
             self.clear_transient_cp_scores()
             return
@@ -218,13 +231,27 @@ class OnePrompt(nn.Module):
         scores = scores.clamp_min(0.0)
         scores = scores / scores.sum().clamp_min(1e-12)
         self.transient_cp_scores.copy_(scores)
+        self.transient_use_raw_compatibility = False
+        self.transient_cp_compatibility.zero_()
+        if router_compatibility is not None:
+            compatibility = torch.as_tensor(
+                router_compatibility,
+                dtype=self.transient_cp_compatibility.dtype,
+                device=self.transient_cp_compatibility.device,
+            )
+            if compatibility.numel() == self.num_experts:
+                compatibility = compatibility - compatibility.mean()
+                self.transient_cp_compatibility.copy_(compatibility.clamp(-3.0, 3.0))
+                self.transient_use_raw_compatibility = True
         self.transient_cp_bias_weight = float(bias_weight)
         self.transient_protect_scale = float(protect_scale)
 
     def clear_transient_cp_scores(self):
         self.transient_cp_scores.fill_(1.0 / max(self.num_experts, 1))
+        self.transient_cp_compatibility.zero_()
         self.transient_cp_bias_weight = 0.0
         self.transient_protect_scale = 0.0
+        self.transient_use_raw_compatibility = False
 
     def get_transient_protection_scale(self):
         """Return expert-wise protection multipliers centered near 1."""
@@ -296,9 +323,15 @@ class OnePrompt(nn.Module):
             )  # (num_heads, num_experts)
             score_bias = None
             if train and self.transient_cp_bias_weight > 0:
-                cp_scores = self.transient_cp_scores.to(pk.device, dtype=pk.dtype)
-                cp_scores = cp_scores / cp_scores.sum().clamp_min(1e-12)
-                cp_scores = cp_scores / cp_scores.mean().clamp_min(1e-12) - 1.0
+                if self.transient_use_raw_compatibility:
+                    cp_scores = self.transient_cp_compatibility.to(
+                        pk.device, dtype=pk.dtype
+                    )
+                else:
+                    # Preserve the historic v5 probability-score behavior.
+                    cp_scores = self.transient_cp_scores.to(pk.device, dtype=pk.dtype)
+                    cp_scores = cp_scores / cp_scores.sum().clamp_min(1e-12)
+                    cp_scores = cp_scores / cp_scores.mean().clamp_min(1e-12) - 1.0
                 score_bias = (
                     self.transient_cp_bias_weight
                     * cp_scores.view(1, 1, 1, self.num_experts)
@@ -565,6 +598,14 @@ class OnePrompt(nn.Module):
             "split_lite_expert_threshold": 0.03,
             "split_lite_active_topk": None,
             "split_lite_strict_current_topk": False,
+            "split_lite_basis_source": "gradient",
+            "split_lite_projection_scope": "all_with_basis",
+            "split_lite_adaptive_conflict": False,
+            "split_lite_use_transient_risk": False,
+            "split_lite_adaptive_alpha_max": 0.5,
+            "split_lite_conflict_weight": 0.6,
+            "functional_tangent_max_memories": 0,
+            "functional_tangent_seed": 1729,
             "expert_usage_mode": "cumulative",
             "enable_usage_diagnostics": True,
             "enable_sensitivity_diagnostics": False,
@@ -578,6 +619,8 @@ class OnePrompt(nn.Module):
             "transient_min_task": 1,
             "transient_cp_bias_weight": 0.1,
             "transient_protect_scale": 1.0,
+            "transient_mode": "legacy_importance",
+            "transient_eval_batches": 2,
             "temperature": 1.0,
             "key_temperature": 2.0,
             "enable_diagnostic_log": False,
