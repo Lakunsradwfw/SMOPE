@@ -109,6 +109,12 @@ def create_args():
         help="override v4 split_lite_alpha (default: 0.2 from model config)",
     )
     parser.add_argument(
+        "--split_lite_rank",
+        type=int,
+        default=None,
+        help="override v4 split_lite_rank used by gradient-projection bases",
+    )
+    parser.add_argument(
         "--split_lite_min_task",
         type=int,
         default=None,
@@ -135,6 +141,23 @@ def create_args():
             "SMoPE's historical counters, task recomputes usage on the current "
             "task loader, old_union protects the union of old important experts"
         ),
+    )
+    parser.add_argument(
+        "--enable_sensitivity_diagnostics",
+        action="store_true",
+        help="save prototypes and log prototype-sensitivity-vs-split-lite basis overlap",
+    )
+    parser.add_argument(
+        "--sensitivity_rank",
+        type=int,
+        default=None,
+        help="rank used for prototype sensitivity basis diagnostics",
+    )
+    parser.add_argument(
+        "--sensitivity_max_memories",
+        type=int,
+        default=None,
+        help="number of recent old task memories used for sensitivity diagnostics",
     )
     parser.add_argument(
         "--experiment_version",

@@ -49,6 +49,7 @@ from protection.loss_logger import (
 )
 from protection.split_lite import SplitLiteProjector
 from protection.transient_prompt import TransientPromptProbe
+from protection.sensitivity_basis import compute_prototype_sensitivity_overlap
 
 
 class Prompt(NormalNN):
@@ -217,6 +218,8 @@ class OnePrompt(Prompt):
             # ── Allow CLI overrides for ablation experiments ──
             if self.config.get("split_lite_alpha") is not None:
                 self._v1_config["split_lite_alpha"] = float(self.config["split_lite_alpha"])
+            if self.config.get("split_lite_rank") is not None:
+                self._v1_config["split_lite_rank"] = int(self.config["split_lite_rank"])
             if self.config.get("split_lite_min_task") is not None:
                 self._v1_config["split_lite_min_task"] = int(self.config["split_lite_min_task"])
             if self.config.get("split_lite_active_topk") is not None:
@@ -225,6 +228,14 @@ class OnePrompt(Prompt):
                 self._v1_config["split_lite_strict_current_topk"] = True
             if self.config.get("expert_usage_mode") is not None:
                 self._v1_config["expert_usage_mode"] = self.config["expert_usage_mode"]
+            if self.config.get("enable_sensitivity_diagnostics"):
+                self._v1_config["enable_sensitivity_diagnostics"] = True
+            if self.config.get("sensitivity_rank") is not None:
+                self._v1_config["sensitivity_rank"] = int(self.config["sensitivity_rank"])
+            if self.config.get("sensitivity_max_memories") is not None:
+                self._v1_config["sensitivity_max_memories"] = int(
+                    self.config["sensitivity_max_memories"]
+                )
             for cfg_key in (
                 "use_transient_prompt",
                 "transient_warmup_batches",
@@ -248,6 +259,9 @@ class OnePrompt(Prompt):
                 "use_transient_prompt": False,
                 "expert_usage_mode": "cumulative",
                 "enable_usage_diagnostics": True,
+                "enable_sensitivity_diagnostics": False,
+                "sensitivity_rank": 4,
+                "sensitivity_max_memories": 4,
             }
         print(f"[DEBUG] v1_config = {self._v1_config}")
         for cfg_key, attr in (
@@ -322,6 +336,43 @@ class OnePrompt(Prompt):
     def _usage_log_path(self):
         version = self.config.get("experiment_version", "v4_split_lite")
         return os.path.join(self.config.get("log_dir", "."), f"{version}_usage.log")
+
+    def _sensitivity_log_path(self):
+        version = self.config.get("experiment_version", "v4_split_lite")
+        return os.path.join(
+            self.config.get("log_dir", "."),
+            f"{version}_sensitivity.log",
+        )
+
+    def _log_sensitivity_overlap(self, prompt, device, phase, active_experts=None):
+        if (
+            not self._v1_config.get("enable_sensitivity_diagnostics", False)
+            or self._split_lite_projector is None
+        ):
+            return
+        try:
+            sens_record = compute_prototype_sensitivity_overlap(
+                prompt,
+                self.old_memories,
+                self._split_lite_projector,
+                rank=self._v1_config.get("sensitivity_rank", 4),
+                max_memories=self._v1_config.get("sensitivity_max_memories", 4),
+                active_experts=active_experts,
+                device=device,
+            )
+            sens_record["task_id"] = int(self.task_count)
+            sens_record["phase"] = phase
+            self._write_jsonl(self._sensitivity_log_path(), sens_record)
+            print(
+                "[sensitivity] Task "
+                f"{self.task_count} {phase} overlap: "
+                f"{sens_record.get('summary', {})}"
+            )
+        except Exception as e:
+            print(
+                "[sensitivity] Warning: Failed to compute prototype "
+                f"sensitivity overlap ({phase}): {e}"
+            )
 
     def _write_jsonl(self, path, record):
         if not path:
@@ -927,7 +978,10 @@ class OnePrompt(Prompt):
                 print(f"[v3] Warning: Failed to save e_pv weights: {e}")
 
         # ── v3 组件三：保存 input prototypes 和 e_pv proto outputs ──
-        need_feat = v1.get("lambda_feat", 0.0) > 0
+        need_feat = (
+            v1.get("lambda_feat", 0.0) > 0
+            or v1.get("enable_sensitivity_diagnostics", False)
+        )
         need_freq = (
             v1.get("lambda_pk", 0.0) > 0
             or v1.get("lambda_pv", 0.0) > 0
@@ -975,6 +1029,18 @@ class OnePrompt(Prompt):
 
         # 保存到 old_memories 列表
         split_summary = None
+        pre_active_experts = None
+        if (
+            self._split_lite_projector is not None
+            and self._split_lite_projector.strict_current_topk
+        ):
+            pre_active_experts = self._split_lite_projector.current_active_experts
+        self._log_sensitivity_overlap(
+            prompt,
+            device,
+            "pre_finalize",
+            pre_active_experts,
+        )
         if self._split_lite_projector is not None:
             try:
                 split_summary = self._split_lite_projector.finalize_task(
@@ -1011,6 +1077,19 @@ class OnePrompt(Prompt):
                     )
             self._write_jsonl(self._usage_log_path(), usage_record)
             self._log_transient_overlap(usage_record, split_summary)
+
+        post_active_experts = None
+        if (
+            self._split_lite_projector is not None
+            and self._split_lite_projector.strict_current_topk
+        ):
+            post_active_experts = split_summary.get("active_experts", []) if split_summary else []
+        self._log_sensitivity_overlap(
+            prompt,
+            device,
+            "post_finalize",
+            post_active_experts,
+        )
 
         self.old_memories.append(memory)
         self._refresh_l2_anchors(prompt)

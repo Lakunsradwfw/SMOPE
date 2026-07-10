@@ -37,6 +37,7 @@ from .key_relation import (
 )
 from .loss_logger import DiagnosticLogger, compute_key_sim_distance
 from .split_lite import SplitLiteProjector
+from .sensitivity_basis import compute_prototype_sensitivity_overlap
 from .transient_prompt import TransientPromptProbe
 
 __all__ = [
@@ -59,5 +60,6 @@ __all__ = [
     "DiagnosticLogger",
     "compute_key_sim_distance",
     "SplitLiteProjector",
+    "compute_prototype_sensitivity_overlap",
     "TransientPromptProbe",
 ]
