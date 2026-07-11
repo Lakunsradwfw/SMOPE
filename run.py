@@ -109,6 +109,16 @@ def create_args():
         help="override v4 split_lite_alpha (default: 0.2 from model config)",
     )
     parser.add_argument(
+        "--disable_split_lite",
+        action="store_true",
+        help="disable Split-Lite entirely for a matched no-projection control",
+    )
+    parser.add_argument(
+        "--enable_causal_audit",
+        action="store_true",
+        help="write pre/post-CRCT causal audit records and component restorations",
+    )
+    parser.add_argument(
         "--split_lite_rank",
         type=int,
         default=None,

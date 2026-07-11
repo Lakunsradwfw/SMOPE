@@ -222,6 +222,10 @@ class OnePrompt(Prompt):
             # ── Allow CLI overrides for ablation experiments ──
             if self.config.get("split_lite_alpha") is not None:
                 self._v1_config["split_lite_alpha"] = float(self.config["split_lite_alpha"])
+            if self.config.get("disable_split_lite", False):
+                self._v1_config["use_split_lite"] = False
+            if self.config.get("enable_causal_audit", False):
+                self._v1_config["enable_causal_audit"] = True
             if self.config.get("split_lite_rank") is not None:
                 self._v1_config["split_lite_rank"] = int(self.config["split_lite_rank"])
             if self.config.get("split_lite_min_task") is not None:
@@ -287,6 +291,7 @@ class OnePrompt(Prompt):
                 "key_temperature": 2.0,
                 "max_feature_memories": 4,
                 "enable_diagnostic_log": False,
+                "enable_causal_audit": False,
                 "use_transient_prompt": False,
                 "expert_usage_mode": "cumulative",
                 "enable_usage_diagnostics": True,
@@ -994,6 +999,7 @@ class OnePrompt(Prompt):
             or v1.get("lambda_pv", 0.0) > 0
             or v1.get("lambda_feat", 0.0) > 0
             or v1.get("use_split_lite", False)
+            or v1.get("enable_causal_audit", False)
         )
         if not any_v3_enabled:
             return
@@ -1015,7 +1021,7 @@ class OnePrompt(Prompt):
             memory.transient_risk_scores = self._transient_risk_scores.detach().cpu().clone()
 
         # ── v3 组件一：保存 e_pk 权重快照 ──
-        if v1.get("lambda_pk", 0.0) > 0:
+        if v1.get("lambda_pk", 0.0) > 0 or v1.get("enable_causal_audit", False):
             try:
                 memory.pk_snapshot = save_pk_weights(prompt, device)
                 print(f"[v3] Saved e_pk snapshot: {len(memory.pk_snapshot)} params")
@@ -1023,7 +1029,7 @@ class OnePrompt(Prompt):
                 print(f"[v3] Warning: Failed to save e_pk weights: {e}")
 
         # ── v3 组件二：保存 e_pv 权重快照 ──
-        if v1.get("lambda_pv", 0.0) > 0:
+        if v1.get("lambda_pv", 0.0) > 0 or v1.get("enable_causal_audit", False):
             try:
                 memory.pv_snapshot = save_pv_weights(prompt, device)
                 print(f"[v3] Saved e_pv snapshot: {len(memory.pv_snapshot)} params")
@@ -1035,6 +1041,7 @@ class OnePrompt(Prompt):
             v1.get("lambda_feat", 0.0) > 0
             or v1.get("enable_sensitivity_diagnostics", False)
             or v1.get("split_lite_basis_source") == "functional_tangent"
+            or v1.get("enable_causal_audit", False)
         )
         need_freq = (
             v1.get("lambda_pk", 0.0) > 0

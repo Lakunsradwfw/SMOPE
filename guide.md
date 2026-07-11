@@ -1002,6 +1002,64 @@ Exp3→Exp4（在 conflict 上加入 transient router 是否有益）、Exp3→E
 提高至少 0.5 且 FR 不变差，才升级该候选至 10-task、5 seeds。不得把缺失的
 repeat 或不同预算的目录混入比较。
 
+其中最重要的是：
+
+- `args.yaml`：确认实际参数
+- `*_effective.log`：每个 repeat 的 FAA、CAA、FR
+- `*_projection.log`：basis、projected vectors、conflict、alpha、removed ratio
+- `*_transient.log`：gain、risk、router bias、delta norm
+- `results-acc/*.yaml`：完整 accuracy history
+
+除了 FAA/CAA/FR，还要检查：
+
+- Exp2：`projection.log` 中是否有 functional basis、active experts、projected vectors
+- Exp3：`mean_alpha` 是否经常高于基础值 `0.2`
+- Exp4：`transient.log` 是否有非零 `gain`、`risk`、`router_bias`
+- Exp5：是否同时出现 conflict 自适应 alpha 和 transient risk
+
+如果 Exp3 的 alpha 始终等于 0.2，说明 conflict 没有触发；如果 Exp4 的 router bias 全为 0，说明 transient 信号没有产生作用。
+
+### 2.13 `e_pv` 遗忘源因果审计（双配置、10-task）
+
+`e_pk` 是 router key，决定一个样本选中哪些 expert；`e_pv` 是 value prefix，决定
+选中 expert 注入注意力层的内容。`e_pv` 参数漂移表示其张量相对旧快照发生变化；
+`e_pv` 功能漂移则是在旧类 input prototype 上，当前输出与保存输出的 MSE。后者是旧
+功能变化的代理，不等于旧任务 accuracy：router 改变或 classifier/CRCT 改变也会造成遗忘。
+
+下列两个脚本是严格配对的遗忘源审计。默认均为 `MAX_TASK=10`、`CRCT_EPOCHS=50`、
+`REPEAT=3`、seeds `0 1 2`，各自必须使用独立输出目录：
+
+```bash
+GPUID=0 bash experiments/cifar-100_audit_no_projection.sh
+GPUID=1 bash experiments/cifar-100_audit_functional_projection.sh
+```
+
+- `audit_no_projection`：保留既有 `e_pk/e_pv` anchor，使用 `--disable_split_lite`，不创建
+  projector。
+- `audit_functional_projection`：仅启用 `functional_tangent + protected_only + topk16 + rank4
+  + alpha0.2`；不启用 conflict 或 transient。
+
+两组都会写入 `causal_audit.jsonl`。任务 2–10 每次记录两个阶段：
+
+- `post_main_pre_crct`：主训练结束、CRCT 前；
+- `post_crct`：CRCT 后。
+
+每条记录包含旧任务逐任务 accuracy、平均旧任务 accuracy、旧类 margin、`e_pv` 功能与
+参数漂移、router logits MSE/KL/top-5 Jaccard。任务 5 和 10 还包含局部恢复反事实：临时
+恢复任务 `t-1` 的 `e_pv`、`e_pk` 或 classifier head 后重新评估；
+`restoration_accuracy_delta` 只表示该组件的局部贡献，三者不能相加。
+
+手工比较先按同 seed 对齐，再看：
+
+- projection 同时降低 `e_pv` 功能漂移、且在 `post_main_pre_crct` 提升旧任务 accuracy：
+  `e_pv` 是有效干预点；
+- T1 有收益、T2 消失：CRCT/head 覆盖了收益；
+- 恢复 `e_pk` 的收益大于恢复 `e_pv`：router 更可能是遗忘源；
+- 恢复 head 的收益主要出现在 T2：classifier/CRCT 更可能是遗忘源。
+
+只有三个 seed 中方向一致，且最终 FAA 或 CAA 有实际提升、FR 不变差，才进入后续机制
+优化；不要把机制日志本身当作性能提升证据。
+
 ---
 
 ## 3. 统一设计原则：Activation-Weighted Stability-Plasticity Trade-off

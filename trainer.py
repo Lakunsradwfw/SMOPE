@@ -17,6 +17,7 @@ from typing import Iterable
 import learners
 from utils import utils_tap
 from utils.schedulers import CosineSchedulerIter
+from protection.causal_audit import CausalAuditLogger, capture_pre_task_state
 
 
 class Trainer:
@@ -204,6 +205,17 @@ class Trainer:
         self.ca_lr = args.ca_lr
         self.ca_weight_decay = args.ca_weight_decay
         self.ca_batch_size_ratio = args.ca_batch_size_ratio
+        self.enable_causal_audit = bool(getattr(args, "enable_causal_audit", False))
+        self.causal_audit = (
+            CausalAuditLogger(
+                log_dir=args.log_dir,
+                version=getattr(args, "experiment_version", "experiment"),
+                seed=seed,
+                repeat_id=round_id + 1,
+            )
+            if self.enable_causal_audit
+            else None
+        )
 
     def task_eval(self, t_index, local=False, task="acc"):
 
@@ -228,6 +240,70 @@ class Trainer:
             )
         else:
             return self.learner.validation(test_loader, task_metric=task)
+
+    def task_eval_with_margin(self, t_index):
+        """Evaluate one old task with global accuracy and true-class margin."""
+        self.test_dataset.load_dataset(t_index, train=True)
+        test_loader = DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=self.workers,
+            pin_memory=True,
+        )
+        model = self.learner.model
+        was_training = model.training
+        model.eval()
+        correct = total = 0
+        margin_sum = 0.0
+        with torch.no_grad():
+            for inputs, targets, _ in test_loader:
+                if self.learner.gpu:
+                    inputs, targets = inputs.cuda(), targets.cuda()
+                logits = model.forward(inputs)[:, : self.learner.valid_out_dim]
+                predictions = logits.argmax(dim=1)
+                correct += int((predictions == targets).sum().item())
+                total += int(targets.numel())
+                true_logits = logits.gather(1, targets.view(-1, 1)).squeeze(1)
+                competitors = logits.clone()
+                competitors.scatter_(1, targets.view(-1, 1), float("-inf"))
+                margin_sum += float((true_logits - competitors.max(dim=1).values).sum().item())
+        model.train(was_training)
+        return {
+            "task_id": int(t_index + 1),
+            "accuracy": float(100.0 * correct / max(total, 1)),
+            "mean_margin": float(margin_sum / max(total, 1)),
+            "old_class_margin": float(margin_sum / max(total, 1)),
+        }
+
+    def _audit_old_tasks(self, current_task_index):
+        return [self.task_eval_with_margin(task_index) for task_index in range(current_task_index)]
+
+    def _write_causal_audit(self, task_index, stage, pre_task_state):
+        if self.causal_audit is None or task_index <= 0:
+            return
+        # learn_batch has already appended the current task memory.  Audit only
+        # memories that existed before this task began.
+        old_memories = self.learner.old_memories[:task_index]
+        if not old_memories:
+            return
+        device = "cuda" if self.learner.gpu else "cpu"
+        record = self.causal_audit.write_stage(
+            model=self.learner.model,
+            task_id=task_index,
+            stage=stage,
+            old_memories=old_memories,
+            device=device,
+            evaluate_old_tasks=lambda: self._audit_old_tasks(task_index),
+            pre_task_state=pre_task_state,
+            include_restorations=(task_index + 1) in {5, 10},
+        )
+        print(
+            "[causal-audit] "
+            f"T{task_index + 1} {stage}: old_acc={record['mean_old_accuracy']:.3f}, "
+            f"pv_drift={record['mean_e_pv_feature_drift']:.8f}"
+        )
 
     def train(self, avg_metrics):
 
@@ -292,6 +368,10 @@ class Trainer:
                     if self.learner.model.prompt is not None:
                         self.learner.model.prompt.process_task_count()  # reinit all the prompt?
 
+            audit_pre_task_state = None
+            if self.enable_causal_audit and i > 0:
+                audit_pre_task_state = capture_pre_task_state(self.learner.model)
+
             # learn
             self.test_dataset.load_dataset(i, train=False)
 
@@ -321,11 +401,22 @@ class Trainer:
                 # compute mean and variance
                 self._compute_mean(model=self.learner.model, class_mask=self.tasks[i])
 
+                if audit_pre_task_state is not None:
+                    self._write_causal_audit(
+                        i, "post_main_pre_crct", audit_pre_task_state
+                    )
+
                 # pseudo replay
                 if i > 0:
                     self.train_task_adaptive_prediction(
                         model=self.learner.model, class_mask=self.tasks, task_id=i
                     )
+
+                if audit_pre_task_state is not None:
+                    self._write_causal_audit(i, "post_crct", audit_pre_task_state)
+            elif audit_pre_task_state is not None:
+                self._write_causal_audit(i, "post_main_pre_crct", audit_pre_task_state)
+                self._write_causal_audit(i, "post_crct_skipped", audit_pre_task_state)
 
             # save model
             if re_train:
